@@ -1,0 +1,58 @@
+# Virtual environments
+.venv/
+venv/
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+*.egg
+*.egg-info/
+.eggs/
+dist/
+build/
+pip-wheel-metadata/
+*.manifest
+*.spec
+
+# Test / coverage
+.pytest_cache/
+.coverage
+.coverage.*
+coverage.xml
+htmlcov/
+.tox/
+.nox/
+.mypy_cache/
+.ruff_cache/
+
+# Local env and secrets (never commit)
+.env
+.env.local
+*.pem
+
+# Hugging Face / caches if stored inside the repo
+.hf_cache/
+hf_cache/
+
+# OS / editor
+.DS_Store
+Thumbs.db
+*.swp
+*.swo
+*~
+.idea/
+.vscode/
+*.code-workspace
+
+# Logs
+*.log
+
+# Bundled ripgrep (downloaded by scripts/bootstrap.sh)
+resources/rg
+
+# Lens: local vector cache SQLite (under configured data_dir; default data-storage)
+**/.lens-cache/
+

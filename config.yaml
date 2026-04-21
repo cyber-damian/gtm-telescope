@@ -1,0 +1,41 @@
+# Default LLM configuration
+llm:
+  base_url: "https://api.openai.com/v1"
+  model: "gpt-4.1-mini"
+  api_key_env: "OPENAI_API_KEY"
+  env_file: ".env"
+
+# Default data storage directory
+storage:
+  data_dir: "data-storage"
+
+# Embedding server + vector cache (optional; defaults match gtm_telescope.config)
+embedding:
+  server_url: "http://localhost:8089"
+  model: "jina-embeddings-v5-nano"
+  # truncate_dim: 256
+  embed_http_timeout: "60"
+  embed_server_ready_sec: "60"
+  # Max bytes per corpus file when indexing (0 = unlimited). Default 5242880 (5 MiB).
+  max_file_bytes: "5242880"
+  # Set to "true" only if embedding.server_url is not on localhost (SSRF guard).
+  # allow_remote: "false"
+
+# Hybrid retrieval tuning (optional)
+retrieval:
+  semantic_candidate_top_k: "15"
+  semantic_threshold: "0.38"
+  semantic_granularity: "token"
+  lexical_max_lines: "500"
+  # Limit results to 10 rows
+  hybrid_report_max_rows: "10"
+  # Show 3 blocks of context in the report
+  hybrid_report_snippet_blocks: "3"
+  hybrid_report_snippet_wrap: "88"
+  # Max chunk rows loaded into RAM per cosine query (safety cap for huge corpora).
+  max_chunk_rows: "500000"
+
+# Child process / LLM HTTP timeouts (seconds)
+process:
+  subprocess_timeout: "120"
+  http_timeout: "120"

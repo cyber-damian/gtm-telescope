@@ -1,0 +1,24 @@
+#!/usr/bin/env python3
+"""Run lens from a git checkout: repo on sys.path; root discovery uses cwd or this script's location."""
+
+from __future__ import annotations
+
+import os
+import sys
+from pathlib import Path
+
+_repo = Path(__file__).resolve().parent.parent
+_venv_py = _repo / ".venv" / "bin" / "python"
+_this = Path(__file__).resolve()
+if _venv_py.is_file():
+    try:
+        if _venv_py.resolve() != Path(sys.executable).resolve():
+            os.execv(str(_venv_py), [str(_venv_py), str(_this), *sys.argv[1:]])
+    except OSError as e:
+        sys.stderr.write(f"lens: warning: could not exec venv Python ({_venv_py}): {e}\n")
+sys.path.insert(0, str(_repo))
+
+from gtm_telescope.cli import main  # noqa: E402
+
+if __name__ == "__main__":
+    main()

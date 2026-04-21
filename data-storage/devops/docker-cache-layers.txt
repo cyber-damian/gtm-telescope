@@ -1,0 +1,7 @@
+Docker image build performance tips
+
+Ordering Dockerfile instructions from least to most frequently changing layers keeps the build cache hot. Put package manager installs and dependency copies before copying application source so a single line edit in src/ does not invalidate earlier expensive steps.
+
+Use multi-stage builds: compile or bundle in a builder stage, then copy only artifacts into a slim runtime image. Combine RUN lines where it improves readability without hiding distinct cache boundaries.
+
+For CI, push cache metadata to a registry when supported so cold builders can still reuse layers across machines.
