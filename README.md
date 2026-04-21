@@ -34,7 +34,7 @@ There are two distinct ways you can use telescope:
 
 ```bash
 # Setup the project
-git clone <repo-url> && cd gtm-telescope
+git clone https://github.com/cyber-damian/gtm-telescope.git && cd gtm-telescope
 ./scripts/bootstrap.sh
 export PATH="$PWD/bin:$PATH"
 cp .env.example .env
