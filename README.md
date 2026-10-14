@@ -83,6 +83,18 @@ lens focus 'GTM_TELESCOPE_LEXICAL_ONLY_MARKER_7f4c2b91'
 lens focus 'warm standby'
 ```
 
+### Evaluating retrieval
+
+`lens eval` measures retrieval quality against a golden set so tuning (thresholds, chunking, models) is not guesswork. Each entry in [`eval/questions.yaml`](eval/questions.yaml) is:
+
+```yaml
+- q: "Do you support SCIM provisioning?"
+  expect: ["product/feature-spec-auth.md"]   # corpus-relative; any listed file counts
+  tags: [exact-term, live]
+```
+
+It prints the rank of the first expected file per question (or `miss`), then **Recall@k**, **MRR** and per-tag breakdowns. Questions with `expect: []` are "should not match" cases: they are excluded from recall and reported as an **abstain rate** (share that returned no hits). The command always exits 0; it is a measurement, not a gate. Run `lens calibrate` first.
+
 ### Commands
 
 | Command | Purpose |
@@ -93,6 +105,7 @@ lens focus 'warm standby'
 | `lens calibrate` | Convert PDF/Office → Markdown; refresh vector cache |
 | `lens focus <text>` | Hybrid search engine |
 | `lens render <text>` | LLM generative response |
+| `lens eval [--file F] [--k 3,10] [--json]` | Run golden questions ([`eval/questions.yaml`](eval/questions.yaml)) through the `focus` retrieval path; prints Recall@k and MRR |
 | `lens cache info` | Vector cache statistics |
 | `lens cache clear` | Remove vector cache on disk |
 
