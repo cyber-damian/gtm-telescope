@@ -1,4 +1,4 @@
-"""Smoke tests for the pure parsing helpers in gtm_telescope.cli."""
+"""Smoke tests for the pure helpers in gtm_telescope.cli (formatting, corpus validation)."""
 
 from __future__ import annotations
 
@@ -6,27 +6,14 @@ from pathlib import Path
 
 from gtm_telescope.cli import (
     _first_non_markdown_or_txt_file_under,
-    _is_boilerplate_snippet,
-    _MergedRow,
-    _parse_path_line_content,
-    _refine_merged_hits,
     _snippet_block_lines,
-    _snippet_dedupe_key,
-    _strip_ansi,
 )
-
-
-def test_strip_ansi_removes_sgr() -> None:
-    assert _strip_ansi("\x1b[31mred\x1b[0m text") == "red text"
-
-
-def test_parse_path_line_content_basic() -> None:
-    parsed = _parse_path_line_content("notes/foo.md:42:some content")
-    assert parsed == ("notes/foo.md", 42, "some content")
-
-
-def test_parse_path_line_content_rejects_garbage() -> None:
-    assert _parse_path_line_content("not a grep record") is None
+from gtm_telescope.retrieval import (
+    Hit,
+    is_boilerplate_snippet,
+    refine_hits,
+    snippet_dedupe_key,
+)
 
 
 def test_snippet_block_lines_header_and_wrap() -> None:
@@ -43,14 +30,21 @@ def test_snippet_block_lines_empty_body() -> None:
     assert lines[-1] == ""
 
 
+def test_snippet_block_lines_range_heading_and_note() -> None:
+    lines = _snippet_block_lines(
+        1, "a.md", 3, "body", wrap=40, end_line=9, heading="Top > Sub", note="⚠ stale"
+    )
+    assert lines[0] == "[1] a.md:3-9 · Top › Sub  ⚠ stale"
+
+
 def test_is_boilerplate_snippet_footer() -> None:
-    assert _is_boilerplate_snippet("Copyright 2025 Acme. All rights reserved.") is True
-    assert _is_boilerplate_snippet("Follow us on LinkedIn for updates.") is True
+    assert is_boilerplate_snippet("Copyright 2025 Acme. All rights reserved.") is True
+    assert is_boilerplate_snippet("Follow us on LinkedIn for updates.") is True
 
 
 def test_is_boilerplate_snippet_technical() -> None:
     assert (
-        _is_boilerplate_snippet(
+        is_boilerplate_snippet(
             "RevealX ingests Zeek logs and correlates them with EDR alerts on Windows hosts."
         )
         is False
@@ -58,19 +52,35 @@ def test_is_boilerplate_snippet_technical() -> None:
 
 
 def test_snippet_dedupe_key_normalizes() -> None:
-    assert _snippet_dedupe_key("  A  B\nC  ") == _snippet_dedupe_key("A B C")
+    assert snippet_dedupe_key("  A  B\nC  ") == snippet_dedupe_key("A B C")
 
 
-def test_refine_merged_hits_dedupes_and_score_floor() -> None:
-    merged = [
-        _MergedRow("a.md", 1, "semantic", 0.9, "unique alpha content here for length"),
-        _MergedRow("b.md", 2, "semantic", 0.85, "unique alpha content here for length"),
-        _MergedRow("c.md", 3, "semantic", 0.2, "unique beta low score passage text here"),
-        _MergedRow("d.md", 4, "semantic", 0.88, "All rights reserved. Contact sales."),
+def _hit(path: str, line: int, text: str) -> Hit:
+    return Hit(
+        path=path,
+        line_no=line,
+        end_line=line,
+        heading=None,
+        text=text,
+        rrf_score=0.03,
+        cos=None,
+        bm25=None,
+        source="lexical",
+        doc_date=None,
+        doc_type=None,
+    )
+
+
+def test_refine_hits_dedupes_drops_boilerplate_and_limits() -> None:
+    hits = [
+        _hit("a.md", 1, "unique alpha content here for length"),
+        _hit("b.md", 2, "unique alpha content here for length"),
+        _hit("d.md", 4, "All rights reserved. Contact sales."),
+        _hit("e.md", 5, "another distinct passage with enough text"),
     ]
-    out = _refine_merged_hits(merged, score_floor=0.38)
-    assert len(out) == 1
-    assert out[0].file_display == "a.md"
+    out = refine_hits(hits, limit=10)
+    assert [h.path for h in out] == ["a.md", "e.md"]
+    assert [h.path for h in refine_hits(hits, limit=1)] == ["a.md"]
 
 
 def test_first_non_markdown_or_txt_none_when_only_allowed(tmp_path: Path) -> None:

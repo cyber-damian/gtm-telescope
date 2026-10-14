@@ -1,7 +1,12 @@
-# Default LLM configuration
+# LLM used by `lens render`. Defaults to a LOCAL OpenAI-compatible server, so nothing leaves
+# the machine. Ollama: http://localhost:11434/v1   LM Studio: http://localhost:1234/v1
+# Hosted (opt-in, e.g. OpenAI): base_url "https://api.openai.com/v1", model "gpt-4.1-mini",
+# and set the key named by api_key_env in .env. Only the question and the retrieved excerpts
+# are sent to a hosted endpoint.
 llm:
-  base_url: "https://api.openai.com/v1"
-  model: "gpt-4.1-mini"
+  base_url: "http://localhost:11434/v1"
+  model: "llama3.1:8b"
+  # Only required for non-localhost endpoints
   api_key_env: "OPENAI_API_KEY"
   env_file: ".env"
 
@@ -25,8 +30,28 @@ embedding:
 retrieval:
   semantic_candidate_top_k: "15"
   semantic_threshold: "0.38"
-  semantic_granularity: "token"
+  # markdown (default): heading-aware chunks with overlap. Also: line | paragraph | sentence | token
+  semantic_granularity: "markdown"
+  # Markdown chunker: target size, merge threshold (estimated tokens = chars / 3), line overlap
+  chunk_tokens: "350"
+  min_chunk_tokens: "40"
+  chunk_overlap_lines: "2"
+  # Lexical (SQLite FTS5 BM25) candidates per query
+  lexical_top_k: "15"
+  # Only used by the ripgrep fallback when SQLite FTS5 is unavailable
   lexical_max_lines: "500"
+  # Reciprocal Rank Fusion: score = sum 1/(rrf_k + rank); boosts are added on top
+  rrf_k: "60"
+  # Added when a chunk contains every quoted phrase (or every term of a short query)
+  exact_boost: "0.02"
+  # Added for doc_type "card" chunks (no effect until cards exist)
+  card_boost: "0.01"
+  # Hits older than this are flagged "stale" (never demoted in ranking)
+  stale_after_days: "365"
+  # lens render: how many top chunks (full text) the LLM receives
+  render_max_chunks: "8"
+  # lens render --batch: confidence is "low" when the top fused score is below this
+  batch_low_rrf: "0.02"
   # Limit results to 10 rows
   hybrid_report_max_rows: "10"
   # Show 3 blocks of context in the report
@@ -34,6 +59,11 @@ retrieval:
   hybrid_report_snippet_wrap: "88"
   # Max chunk rows loaded into RAM per cosine query (safety cap for huge corpora).
   max_chunk_rows: "500000"
+
+# What `lens calibrate` does with PDF/Office files after converting them to Markdown
+calibrate:
+  # move: relocate to <data_dir>/.originals/ (default) | keep: leave in place | delete: remove
+  originals: move
 
 # Child process / LLM HTTP timeouts (seconds)
 process:

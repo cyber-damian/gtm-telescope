@@ -143,3 +143,79 @@ paths:
     s = load_telescope_settings(yaml)
     assert s.jina_grep_bin == "/opt/jina-grep"
     assert s.rg_bin == "/opt/rg"
+
+
+def test_phase1_retrieval_defaults() -> None:
+    s = load_telescope_settings("")
+    assert s.semantic_granularity == "markdown"
+    assert (s.chunk_tokens, s.min_chunk_tokens, s.chunk_overlap_lines) == (350, 40, 2)
+    assert (s.lexical_top_k, s.rrf_k) == (15, 60)
+    assert (s.exact_boost, s.card_boost) == (0.02, 0.01)
+    assert s.stale_after_days == 365
+    assert s.calibrate_originals == "move"
+    assert s.chunk_params.granularity == "markdown"
+
+
+def test_phase1_retrieval_overrides_and_validation() -> None:
+    s = load_telescope_settings(
+        "retrieval:\n"
+        '  semantic_granularity: "token"\n'
+        '  chunk_tokens: "500"\n'
+        '  min_chunk_tokens: "10"\n'
+        '  chunk_overlap_lines: "0"\n'
+        '  lexical_top_k: "7"\n'
+        '  rrf_k: "30"\n'
+        '  exact_boost: "0"\n'
+        '  card_boost: "0.5"\n'
+        '  stale_after_days: "90"\n'
+        "calibrate:\n"
+        "  originals: keep\n"
+    )
+    assert s.semantic_granularity == "token"
+    assert (s.chunk_tokens, s.min_chunk_tokens, s.chunk_overlap_lines) == (500, 10, 0)
+    assert (s.lexical_top_k, s.rrf_k, s.stale_after_days) == (7, 30, 90)
+    assert (s.exact_boost, s.card_boost) == (0.0, 0.5)
+    assert s.calibrate_originals == "keep"
+
+
+def test_phase1_invalid_values_fall_back_to_defaults() -> None:
+    s = load_telescope_settings(
+        "retrieval:\n"
+        '  semantic_granularity: "bogus"\n'
+        '  chunk_tokens: "3"\n'
+        '  min_chunk_tokens: "9999"\n'
+        '  chunk_overlap_lines: "-1"\n'
+        '  lexical_top_k: "0"\n'
+        '  rrf_k: "abc"\n'
+        '  exact_boost: "-0.1"\n'
+        '  stale_after_days: "0"\n'
+        "calibrate:\n"
+        "  originals: shred\n"
+    )
+    assert s.semantic_granularity == "markdown"
+    assert s.chunk_tokens == 350
+    assert s.min_chunk_tokens < s.chunk_tokens
+    assert s.chunk_overlap_lines == 2
+    assert (s.lexical_top_k, s.rrf_k, s.exact_boost, s.stale_after_days) == (15, 60, 0.02, 365)
+    assert s.calibrate_originals == "move"  # never fall back to "delete"
+
+
+def test_render_settings_defaults_and_overrides() -> None:
+    d = load_telescope_settings("")
+    assert d.render_max_chunks == 8 and d.batch_low_rrf == 0.02
+    c = load_telescope_settings('retrieval:\n  render_max_chunks: "3"\n  batch_low_rrf: "0.05"\n')
+    assert c.render_max_chunks == 3 and c.batch_low_rrf == 0.05
+
+
+def test_render_settings_invalid_fall_back() -> None:
+    c = load_telescope_settings('retrieval:\n  render_max_chunks: "0"\n  batch_low_rrf: "x"\n')
+    assert c.render_max_chunks == 8 and c.batch_low_rrf == 0.02
+
+
+def test_shipped_config_defaults_to_local_llm() -> None:
+    from pathlib import Path
+
+    text = (Path(__file__).resolve().parent.parent / "config.yaml").read_text(encoding="utf-8")
+    llm = parse_yaml_block(text, "llm")
+    assert llm["base_url"] == "http://localhost:11434/v1"
+    assert llm["model"] == "llama3.1:8b"

@@ -1,6 +1,8 @@
 """Local vector cache for `lens focus` / `lens render`.
 
-Stores per-chunk embeddings in SQLite under <data_dir>/.lens-cache/embeddings.sqlite.
+Stores per-chunk embeddings (plus an FTS5 lexical index) in SQLite under
+<data_dir>/.lens-cache/embeddings.sqlite. Indexing happens only in ``refresh_index`` (lens
+calibrate); the read path (focus/render/eval) never embeds corpus files.
 Embeds via HTTP POST /v1/embeddings on the jina-grep embedding server. User-facing
 tunables are loaded in `gtm_telescope.config`; this module only accepts explicit parameters.
 """
@@ -21,12 +23,18 @@ import urllib.parse
 import urllib.request
 from collections.abc import Iterable
 from contextlib import suppress
+from dataclasses import dataclass
+from datetime import date, datetime, timezone
 from pathlib import Path
 from typing import Any
 
 import numpy as np
 
-SCHEMA_VERSION = 1
+from gtm_telescope import chunking
+from gtm_telescope.chunking import Chunk, ChunkedDoc, ChunkParams
+from gtm_telescope.corpus import CORPUS_SUFFIXES, SKIP_CORPUS_DIRS
+
+SCHEMA_VERSION = 2
 DEFAULT_SERVER_URL = "http://localhost:8089"
 DEFAULT_MODEL = "jina-embeddings-v5-nano"
 DEFAULT_TASK = "retrieval"
@@ -155,27 +163,75 @@ def embed_batch(
 
 
 def split_into_chunks(content: str, granularity: str) -> list[tuple[int, str]]:
-    """Defer to jina-grep's splitter so cached chunks match server-side semantics."""
+    """Defer to jina-grep's splitter (granularity line/paragraph/sentence/token)."""
     from jina_grep.client import split_into_chunks as _impl
 
     return _impl(content, granularity)
+
+
+def chunk_file(content: str, suffix: str, params: ChunkParams) -> ChunkedDoc:
+    """Chunk one corpus file. ``markdown`` uses our chunker; other granularities use jina-grep."""
+    if params.granularity == "markdown":
+        return chunking.chunk_document(content, suffix, params)
+    meta, _body, _offset = chunking.split_frontmatter(content)
+    chunks: list[Chunk] = []
+    for line_no, body in split_into_chunks(content, params.granularity):
+        if not body.strip():
+            continue
+        end_line = line_no + body.rstrip("\n").count("\n")
+        chunks.append(Chunk(line_no=line_no, end_line=end_line, heading_path="", text=body))
+    title = str(meta["title"]).strip() if meta.get("title") else None
+    return ChunkedDoc(meta=meta, title=title, chunks=chunks)
 
 
 def _sha256(b: bytes) -> str:
     return hashlib.sha256(b).hexdigest()
 
 
-def _expected_meta(model: str, granularity: str, dim: int | None) -> dict[str, str]:
-    return {
+def _expected_meta(
+    model: str, granularity: str, dim: int | None, chunk: ChunkParams | None = None
+) -> dict[str, str]:
+    meta = {
         "schema_version": str(SCHEMA_VERSION),
         "model": model,
         "task": DEFAULT_TASK,
         "granularity": granularity,
         "dim": str(dim) if dim is not None else "full",
     }
+    if granularity == "markdown":
+        c = chunk or ChunkParams()
+        meta["chunk_tokens"] = str(c.chunk_tokens)
+        meta["min_chunk_tokens"] = str(c.min_chunk_tokens)
+        meta["chunk_overlap_lines"] = str(c.chunk_overlap_lines)
+    return meta
 
 
-_SCHEMA_DDL = """
+def _iso_date(raw: object) -> str | None:
+    if not isinstance(raw, str):
+        return None
+    try:
+        return date.fromisoformat(raw.strip()[:10]).isoformat()
+    except ValueError:
+        return None
+
+
+def resolve_doc_date(meta: dict[str, Any], mtime_ns: int) -> str:
+    """ISO date: frontmatter ``updated``/``date`` > ``source_mtime`` (calibrate) > file mtime."""
+    for key in ("updated", "date", "source_mtime"):
+        d = _iso_date(meta.get(key))
+        if d:
+            return d
+    return datetime.fromtimestamp(mtime_ns / 1e9, tz=timezone.utc).date().isoformat()
+
+
+def _doc_type(meta: dict[str, Any]) -> str | None:
+    raw = meta.get("type")
+    if isinstance(raw, str) and raw.strip():
+        return raw.strip().lower()
+    return None
+
+
+_BASE_DDL = """
 CREATE TABLE IF NOT EXISTS meta (
     key TEXT PRIMARY KEY,
     value TEXT NOT NULL
@@ -184,18 +240,101 @@ CREATE TABLE IF NOT EXISTS files (
     path TEXT PRIMARY KEY,
     mtime_ns INTEGER NOT NULL,
     size INTEGER NOT NULL,
-    sha256 TEXT NOT NULL
+    sha256 TEXT NOT NULL,
+    doc_date TEXT,
+    doc_type TEXT,
+    title TEXT
 );
 CREATE TABLE IF NOT EXISTS chunks (
     path TEXT NOT NULL,
     idx INTEGER NOT NULL,
     line_no INTEGER NOT NULL,
+    end_line INTEGER NOT NULL,
+    heading TEXT,
     text TEXT NOT NULL,
     vector BLOB NOT NULL,
     PRIMARY KEY (path, idx)
 );
 CREATE INDEX IF NOT EXISTS chunks_path_idx ON chunks(path);
 """
+
+# External-content FTS5 index kept in sync by triggers. Note: chunks are never written with
+# INSERT OR REPLACE (REPLACE does not fire delete triggers unless recursive_triggers is on);
+# the sync code deletes a file's chunks explicitly before re-inserting.
+_FTS_DDL = """
+CREATE VIRTUAL TABLE IF NOT EXISTS chunks_fts USING fts5(
+    heading, text,
+    content='chunks', content_rowid='rowid',
+    tokenize='unicode61 remove_diacritics 2'
+);
+CREATE TRIGGER IF NOT EXISTS chunks_fts_ai AFTER INSERT ON chunks BEGIN
+    INSERT INTO chunks_fts(rowid, heading, text) VALUES (new.rowid, new.heading, new.text);
+END;
+CREATE TRIGGER IF NOT EXISTS chunks_fts_ad AFTER DELETE ON chunks BEGIN
+    INSERT INTO chunks_fts(chunks_fts, rowid, heading, text)
+    VALUES ('delete', old.rowid, old.heading, old.text);
+END;
+CREATE TRIGGER IF NOT EXISTS chunks_fts_au AFTER UPDATE ON chunks BEGIN
+    INSERT INTO chunks_fts(chunks_fts, rowid, heading, text)
+    VALUES ('delete', old.rowid, old.heading, old.text);
+    INSERT INTO chunks_fts(rowid, heading, text) VALUES (new.rowid, new.heading, new.text);
+END;
+"""
+
+_fts_warned = False
+
+
+def _warn_fts_unavailable() -> None:
+    global _fts_warned
+    if _fts_warned:
+        return
+    _fts_warned = True
+    sys.stderr.write(
+        "vector cache: SQLite FTS5 is unavailable; lexical search falls back to ripgrep\n"
+    )
+    sys.stderr.flush()
+
+
+def _migrate_legacy_schema(conn: sqlite3.Connection) -> None:
+    """Drop a pre-v2 cache wholesale (column layout changed; ``DELETE`` is not enough)."""
+    tables = {r[0] for r in conn.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+    if not tables:
+        return
+    old: str | None = None
+    if "meta" in tables:
+        row = conn.execute("SELECT value FROM meta WHERE key='schema_version'").fetchone()
+        if row and row[0] != str(SCHEMA_VERSION):
+            old = row[0]
+    if old is None and "chunks" in tables:
+        cols = {r[1] for r in conn.execute("PRAGMA table_info(chunks)")}
+        if "end_line" not in cols:
+            old = "1"
+    if old is None:
+        return
+    for trig in ("chunks_fts_ai", "chunks_fts_ad", "chunks_fts_au"):
+        conn.execute(f"DROP TRIGGER IF EXISTS {trig}")
+    with suppress(sqlite3.OperationalError):
+        conn.execute("DROP TABLE IF EXISTS chunks_fts")
+    for t in ("chunks", "files", "meta"):
+        conn.execute(f"DROP TABLE IF EXISTS {t}")
+    conn.commit()
+    sys.stderr.write(
+        f"vector cache: schema v{old} -> v{SCHEMA_VERSION}; rebuilding the index "
+        "(re-embeds the whole corpus)\n"
+    )
+    sys.stderr.flush()
+
+
+def _ensure_fts(conn: sqlite3.Connection) -> bool:
+    try:
+        conn.executescript(_FTS_DDL)
+    except sqlite3.OperationalError as e:
+        msg = str(e).lower()
+        if "fts5" in msg or "no such module" in msg:
+            _warn_fts_unavailable()
+            return False
+        raise
+    return True
 
 
 def _connect(db_path: Path) -> sqlite3.Connection:
@@ -204,8 +343,16 @@ def _connect(db_path: Path) -> sqlite3.Connection:
     conn.execute("PRAGMA journal_mode=WAL")
     conn.execute("PRAGMA synchronous=NORMAL")
     conn.execute("PRAGMA busy_timeout=5000")
-    conn.executescript(_SCHEMA_DDL)
+    _migrate_legacy_schema(conn)
+    conn.executescript(_BASE_DDL)
+    _ensure_fts(conn)
     return conn
+
+
+def has_fts(conn: sqlite3.Connection) -> bool:
+    """True if the FTS5 index exists in this database."""
+    row = conn.execute("SELECT 1 FROM sqlite_master WHERE name='chunks_fts'").fetchone()
+    return row is not None
 
 
 def _meta_get(conn: sqlite3.Connection) -> dict[str, str]:
@@ -222,12 +369,13 @@ def _meta_set(conn: sqlite3.Connection, meta: dict[str, str]) -> None:
 def _prepare_meta(conn: sqlite3.Connection, expected_meta: dict[str, str]) -> None:
     current = _meta_get(conn)
     if current and any(current.get(k) != v for k, v in expected_meta.items()):
+        # Triggers keep chunks_fts in sync with the chunk deletes.
         conn.executescript("DELETE FROM chunks; DELETE FROM files; DELETE FROM meta;")
     _meta_set(conn, expected_meta)
 
 
-_CORPUS_SUFFIXES = frozenset({".md", ".markdown", ".txt"})
-_CORPUS_SKIP_DIRS = frozenset({".lens-cache"})
+_CORPUS_SUFFIXES = CORPUS_SUFFIXES
+_CORPUS_SKIP_DIRS = SKIP_CORPUS_DIRS
 
 
 def _walk_corpus(data: Path) -> Iterable[Path]:
@@ -259,6 +407,14 @@ def _blob_to_vector(b: bytes) -> np.ndarray:
     return np.frombuffer(b, dtype=np.float32)
 
 
+@dataclass(frozen=True)
+class _PendingChunk:
+    path: str
+    idx: int
+    chunk: Chunk
+    embed_text: str
+
+
 def _sync_corpus_into_cache(
     conn: sqlite3.Connection,
     data: Path,
@@ -270,8 +426,17 @@ def _sync_corpus_into_cache(
     timeout: float,
     log_progress: bool = True,
     max_file_bytes: int | None = None,
+    chunk_params: ChunkParams | None = None,
 ) -> tuple[int, int]:
     """Bring the cache in sync with disk. Returns (files_reindexed, chunks_embedded)."""
+    params = chunk_params or ChunkParams(granularity=granularity)
+    if params.granularity != granularity:
+        params = ChunkParams(
+            granularity=granularity,
+            chunk_tokens=params.chunk_tokens,
+            min_chunk_tokens=params.min_chunk_tokens,
+            chunk_overlap_lines=params.chunk_overlap_lines,
+        )
     data_resolved = data.resolve()
     live_paths: set[str] = set()
     pending_meta_updates: list[tuple[int, int, str]] = []
@@ -312,14 +477,24 @@ def _sync_corpus_into_cache(
     existing = {r[0] for r in conn.execute("SELECT path FROM files")}
     gone = existing - live_paths
 
-    buffered: list[tuple[str, int, int, str]] = []
-    for abs_path, _mtime, _size, _sha, content_bytes in to_index:
+    buffered: list[_PendingChunk] = []
+    file_rows: list[tuple[str, int, int, str, str, str | None, str | None]] = []
+    for abs_path, mtime_ns, size, sha, content_bytes in to_index:
         text = content_bytes.decode("utf-8", errors="replace")
-        chunks = split_into_chunks(text, granularity)
-        for idx, (line_no, body) in enumerate(chunks):
-            if not body.strip():
-                continue
-            buffered.append((abs_path, idx, line_no, body))
+        doc = chunk_file(text, Path(abs_path).suffix, params)
+        file_rows.append(
+            (
+                abs_path,
+                mtime_ns,
+                size,
+                sha,
+                resolve_doc_date(doc.meta, mtime_ns),
+                _doc_type(doc.meta),
+                doc.title,
+            )
+        )
+        for idx, ch in enumerate(doc.chunks):
+            buffered.append(_PendingChunk(abs_path, idx, ch, chunking.embedding_input(ch)))
 
     paths_dirty = [t[0] for t in to_index]
     n_chunks = len(buffered)
@@ -350,7 +525,7 @@ def _sync_corpus_into_cache(
             qmarks = ",".join("?" * len(paths_dirty))
             conn.execute(f"DELETE FROM chunks WHERE path IN ({qmarks})", paths_dirty)
 
-        if not buffered and not pending_meta_updates and not gone:
+        if not to_index and not pending_meta_updates and not gone:
             conn.commit()
             return (0, 0)
 
@@ -358,9 +533,8 @@ def _sync_corpus_into_cache(
             with EmbeddingHttpClient(server, timeout) as http_client:
                 for start in range(0, n_chunks, EMBED_BATCH):
                     batch = buffered[start : start + EMBED_BATCH]
-                    texts = [b[3] for b in batch]
                     vecs = embed_batch(
-                        texts,
+                        [b.embed_text for b in batch],
                         prompt_name="document",
                         model=model,
                         task=DEFAULT_TASK,
@@ -369,15 +543,20 @@ def _sync_corpus_into_cache(
                         timeout=timeout,
                         http_client=http_client,
                     )
-                    ins = (
-                        "INSERT INTO chunks(path, idx, line_no, text, vector) "
-                        "VALUES (?, ?, ?, ?, ?)"
-                    )
                     conn.executemany(
-                        ins,
+                        "INSERT INTO chunks(path, idx, line_no, end_line, heading, text, vector) "
+                        "VALUES (?, ?, ?, ?, ?, ?, ?)",
                         [
-                            (p, i, ln, t, _vector_to_blob(vecs[k]))
-                            for k, (p, i, ln, t) in enumerate(batch)
+                            (
+                                b.path,
+                                b.idx,
+                                b.chunk.line_no,
+                                b.chunk.end_line,
+                                b.chunk.heading_path or None,
+                                b.chunk.text,
+                                _vector_to_blob(vecs[k]),
+                            )
+                            for k, b in enumerate(batch)
                         ],
                     )
                     if log_progress and n_chunks:
@@ -385,10 +564,12 @@ def _sync_corpus_into_cache(
                         sys.stderr.write(f"vector cache: embedded {end}/{n_chunks} chunk(s)…\n")
                         sys.stderr.flush()
 
-        if to_index:
+        if file_rows:
             conn.executemany(
-                "INSERT OR REPLACE INTO files(path, mtime_ns, size, sha256) VALUES (?,?,?,?)",
-                [(p, mt, sz, sh) for p, mt, sz, sh, _ in to_index],
+                "INSERT OR REPLACE INTO files"
+                "(path, mtime_ns, size, sha256, doc_date, doc_type, title) "
+                "VALUES (?,?,?,?,?,?,?)",
+                file_rows,
             )
         conn.commit()
     except (
@@ -486,6 +667,7 @@ def cache_info(data: Path) -> dict[str, Any]:
     try:
         meta = _meta_get(conn)
         out["meta"] = meta
+        out["schema_ok"] = meta.get("schema_version") == str(SCHEMA_VERSION)
         out["file_rows"] = conn.execute("SELECT COUNT(*) FROM files").fetchone()[0]
         out["chunk_rows"] = conn.execute("SELECT COUNT(*) FROM chunks").fetchone()[0]
         row = conn.execute("SELECT SUM(LENGTH(vector)) FROM chunks").fetchone()
@@ -493,6 +675,7 @@ def cache_info(data: Path) -> dict[str, Any]:
         row_max = conn.execute("SELECT MAX(mtime_ns) FROM files").fetchone()
         out["max_mtime_ns"] = row_max[0]
         out["stale_or_new_files"] = count_corpus_drift(conn, data)
+        out["fts5"] = has_fts(conn)
     finally:
         conn.close()
     return out
@@ -508,11 +691,12 @@ def refresh_index(
     timeout: float,
     log_progress: bool = True,
     max_file_bytes: int | None = None,
+    chunk_params: ChunkParams | None = None,
 ) -> tuple[int, int]:
     """Open DB, ensure meta matches, sync corpus. Returns (files_reindexed, chunks_embedded)."""
     data_resolved = data.resolve()
     db_path = cache_db_path(data_resolved)
-    expected = _expected_meta(model, granularity, dim)
+    expected = _expected_meta(model, granularity, dim, chunk_params)
     conn = _connect(db_path)
     try:
         _prepare_meta(conn, expected)
@@ -526,109 +710,148 @@ def refresh_index(
             timeout=timeout,
             log_progress=log_progress,
             max_file_bytes=max_file_bytes,
+            chunk_params=chunk_params,
         )
     finally:
         conn.close()
 
 
-def collect_semantic_results(
+# --------------------------------------------------------------------------------------
+# Read path (focus / render / eval). Never writes, never embeds corpus files.
+# --------------------------------------------------------------------------------------
+
+ChunkKey = tuple[str, int]
+
+
+@dataclass(frozen=True)
+class ChunkRow:
+    path: str
+    idx: int
+    line_no: int
+    end_line: int
+    heading: str | None
+    text: str
+    doc_date: str | None
+    doc_type: str | None
+    title: str | None
+
+
+@dataclass(frozen=True)
+class VectorMatrix:
+    keys: list[ChunkKey]
+    matrix: np.ndarray  # [N, D] float32, rows L2-normalized
+
+
+def open_readonly(data: Path) -> sqlite3.Connection | None:
+    """Open the cache read-only; ``None`` if it does not exist."""
+    db_path = cache_db_path(data)
+    if not db_path.is_file():
+        return None
+    return sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+
+
+def lexical_search_fts(
+    conn: sqlite3.Connection, match_expr: str, limit: int
+) -> list[tuple[ChunkKey, float]]:
+    """FTS5 BM25 search (heading weighted 2x). Returns ``[((path, idx), bm25)]``, best first.
+
+    ``match_expr`` must come from :func:`gtm_telescope.query.to_fts5` (fully quoted).
+    """
+    rows = conn.execute(
+        "SELECT c.path, c.idx, bm25(chunks_fts, 2.0, 1.0) AS score "
+        "FROM chunks_fts JOIN chunks c ON c.rowid = chunks_fts.rowid "
+        "WHERE chunks_fts MATCH ? ORDER BY score LIMIT ?",
+        (match_expr, limit),
+    ).fetchall()
+    return [((r[0], int(r[1])), float(r[2])) for r in rows]
+
+
+def chunk_spans(conn: sqlite3.Connection) -> dict[str, list[tuple[int, int, int]]]:
+    """``{path: [(idx, line_no, end_line), ...]}`` for mapping line hits to chunks."""
+    out: dict[str, list[tuple[int, int, int]]] = {}
+    for path, idx, a, b in conn.execute(
+        "SELECT path, idx, line_no, end_line FROM chunks ORDER BY path, idx"
+    ):
+        out.setdefault(path, []).append((int(idx), int(a), int(b)))
+    return out
+
+
+def fetch_chunk_rows(
+    conn: sqlite3.Connection, keys: Iterable[ChunkKey]
+) -> dict[ChunkKey, ChunkRow]:
+    wanted = list(dict.fromkeys(keys))
+    out: dict[ChunkKey, ChunkRow] = {}
+    for start in range(0, len(wanted), 400):
+        part = wanted[start : start + 400]
+        clause = " OR ".join("(c.path = ? AND c.idx = ?)" for _ in part)
+        params = [v for k in part for v in k]
+        for r in conn.execute(
+            "SELECT c.path, c.idx, c.line_no, c.end_line, c.heading, c.text, "
+            "f.doc_date, f.doc_type, f.title "
+            "FROM chunks c LEFT JOIN files f ON f.path = c.path "
+            f"WHERE {clause}",
+            params,
+        ):
+            row = ChunkRow(r[0], int(r[1]), int(r[2]), int(r[3]), r[4], r[5], r[6], r[7], r[8])
+            out[(row.path, row.idx)] = row
+    return out
+
+
+def load_vector_matrix(conn: sqlite3.Connection, max_chunk_rows: int) -> VectorMatrix | None:
+    n_total = conn.execute("SELECT COUNT(*) FROM chunks").fetchone()[0]
+    if n_total == 0:
+        return None
+    if n_total > max_chunk_rows:
+        sys.stderr.write(
+            f"vector cache: warning: {n_total} chunk rows exceed retrieval.max_chunk_rows "
+            f"({max_chunk_rows}); loading first {max_chunk_rows} rows for this query only\n"
+        )
+        sys.stderr.flush()
+    keys: list[ChunkKey] = []
+    blobs: list[bytes] = []
+    for path, idx, blob in conn.execute(
+        "SELECT path, idx, vector FROM chunks LIMIT ?", (max_chunk_rows,)
+    ):
+        keys.append((path, int(idx)))
+        blobs.append(blob)
+    if not blobs:
+        return None
+    mat = np.frombuffer(b"".join(blobs), dtype=np.float32).reshape(len(blobs), -1)
+    return VectorMatrix(keys=keys, matrix=mat)
+
+
+def semantic_rank(
+    vm: VectorMatrix, query_vec: np.ndarray, *, top_k: int, threshold: float
+) -> list[tuple[ChunkKey, float]]:
+    """Cosine top-k (vectors are normalized), filtered by ``threshold``; best first."""
+    scores = vm.matrix @ query_vec
+    k = min(top_k, scores.shape[0])
+    if k <= 0:
+        return []
+    part = np.argpartition(-scores, k - 1)[:k]
+    ordered = part[np.argsort(-scores[part])]
+    return [(vm.keys[int(j)], float(scores[j])) for j in ordered if float(scores[j]) >= threshold]
+
+
+def embed_query(
     query: str,
-    data: Path,
     *,
     server_url: str,
     model: str,
     dim: int | None,
-    granularity: str,
-    threshold: float,
-    top_k: int,
     timeout: float,
-    max_file_bytes: int | None = None,
-    max_chunk_rows: int = 500_000,
-) -> dict[tuple[str, int], tuple[float, str]]:
-    """Cache-backed semantic search.
-
-    Returns { (abs_path, line_no): (cosine_score, snippet_text) }.
-    Caller must ensure the embedding server is reachable before calling.
-    """
-    expected_meta = _expected_meta(model, granularity, dim)
-    data_resolved = data.resolve()
-    db_path = cache_db_path(data_resolved)
-    conn = _connect(db_path)
-    try:
-        _prepare_meta(conn, expected_meta)
-        _sync_corpus_into_cache(
-            conn,
-            data_resolved,
-            granularity=granularity,
+) -> np.ndarray:
+    with EmbeddingHttpClient(server_url, timeout) as http_client:
+        return embed_batch(
+            [query],
+            prompt_name="query",
             model=model,
+            task=DEFAULT_TASK,
             dim=dim,
             server=server_url,
             timeout=timeout,
-            max_file_bytes=max_file_bytes,
-        )
-
-        n_total = conn.execute("SELECT COUNT(*) FROM chunks").fetchone()[0]
-        if n_total == 0:
-            return {}
-
-        if n_total > max_chunk_rows:
-            sys.stderr.write(
-                f"vector cache: warning: {n_total} chunk rows exceed retrieval.max_chunk_rows "
-                f"({max_chunk_rows}); loading first {max_chunk_rows} rows for this query only\n"
-            )
-            sys.stderr.flush()
-
-        cur = conn.execute(
-            "SELECT path, line_no, text, vector FROM chunks LIMIT ?",
-            (max_chunk_rows,),
-        )
-        first = cur.fetchone()
-        if first is None:
-            return {}
-        dim_vec = len(first[3]) // 4
-        rows = [first]
-        rows.extend(cur.fetchall())
-        n = len(rows)
-        paths = [r[0] for r in rows]
-        lines = [r[1] for r in rows]
-        texts = [r[2] for r in rows]
-        mat = np.empty((n, dim_vec), dtype=np.float32)
-        for i, r in enumerate(rows):
-            mat[i] = _blob_to_vector(r[3])
-
-        with EmbeddingHttpClient(server_url, timeout) as http_client:
-            q = embed_batch(
-                [query],
-                prompt_name="query",
-                model=model,
-                task=DEFAULT_TASK,
-                dim=dim,
-                server=server_url,
-                timeout=timeout,
-                http_client=http_client,
-            )[0]
-
-        scores = mat @ q
-        n_scores = scores.shape[0]
-        k = min(top_k, n_scores)
-        if k <= 0:
-            return {}
-
-        idx_part = np.argpartition(-scores, k - 1)[:k]
-        idx_sorted = idx_part[np.argsort(-scores[idx_part])]
-
-        results: dict[tuple[str, int], tuple[float, str]] = {}
-        for j in idx_sorted:
-            s = float(scores[j])
-            if s < threshold:
-                continue
-            key = (paths[j], int(lines[j]))
-            prev = results.get(key)
-            if prev is None or s > prev[0]:
-                results[key] = (s, texts[j])
-        return results
-    finally:
-        conn.close()
+            http_client=http_client,
+        )[0]
 
 
 __all__ = [
@@ -636,16 +859,27 @@ __all__ = [
     "DEFAULT_SERVER_URL",
     "DEFAULT_TASK",
     "EMBED_BATCH",
-    "EmbeddingHttpClient",
     "SCHEMA_VERSION",
     "VALID_TRUNCATE_DIMS",
+    "ChunkRow",
+    "EmbeddingHttpClient",
+    "VectorMatrix",
     "cache_db_path",
     "cache_info",
+    "chunk_file",
+    "chunk_spans",
     "clear_cache",
-    "collect_semantic_results",
     "corpus_has_indexable_files",
     "count_corpus_drift",
     "embed_batch",
+    "embed_query",
+    "fetch_chunk_rows",
+    "has_fts",
     "health_check",
+    "lexical_search_fts",
+    "load_vector_matrix",
+    "open_readonly",
     "refresh_index",
+    "resolve_doc_date",
+    "semantic_rank",
 ]
