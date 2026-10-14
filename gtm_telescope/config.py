@@ -9,14 +9,26 @@ from __future__ import annotations
 from dataclasses import dataclass
 from urllib.parse import urlparse
 
-from gtm_telescope import vector_cache
+from gtm_telescope import chunking, vector_cache
 
 # --- Defaults (also used when YAML omits a value) ---
 
 DEFAULT_SEMANTIC_CANDIDATE_TOP_K = 15
 DEFAULT_SEMANTIC_SIMILARITY_THRESHOLD = 0.38
-VALID_SEMANTIC_GRANULARITY = frozenset({"line", "paragraph", "sentence", "token"})
-DEFAULT_SEMANTIC_GRANULARITY = "token"
+VALID_SEMANTIC_GRANULARITY = frozenset(
+    {"markdown", "line", "paragraph", "sentence", "token"}
+)
+DEFAULT_SEMANTIC_GRANULARITY = "markdown"
+DEFAULT_CHUNK_TOKENS = chunking.DEFAULT_CHUNK_TOKENS
+DEFAULT_MIN_CHUNK_TOKENS = chunking.DEFAULT_MIN_CHUNK_TOKENS
+DEFAULT_CHUNK_OVERLAP_LINES = chunking.DEFAULT_CHUNK_OVERLAP_LINES
+DEFAULT_LEXICAL_TOP_K = 15
+DEFAULT_RRF_K = 60
+DEFAULT_EXACT_BOOST = 0.02
+DEFAULT_CARD_BOOST = 0.01
+DEFAULT_STALE_AFTER_DAYS = 365
+VALID_ORIGINALS_MODES = frozenset({"move", "keep", "delete"})
+DEFAULT_ORIGINALS_MODE = "move"
 DEFAULT_LEXICAL_MAX_LINES = 500
 DEFAULT_HYBRID_REPORT_MAX_ROWS = 10
 DEFAULT_HYBRID_REPORT_SNIPPET_BLOCKS = 3
@@ -57,6 +69,24 @@ class TelescopeSettings:
     embedding_allow_remote: bool
     max_file_bytes: int | None
     max_chunk_rows: int
+    chunk_tokens: int
+    min_chunk_tokens: int
+    chunk_overlap_lines: int
+    lexical_top_k: int
+    rrf_k: int
+    exact_boost: float
+    card_boost: float
+    stale_after_days: int
+    calibrate_originals: str
+
+    @property
+    def chunk_params(self) -> chunking.ChunkParams:
+        return chunking.ChunkParams(
+            granularity=self.semantic_granularity,
+            chunk_tokens=self.chunk_tokens,
+            min_chunk_tokens=self.min_chunk_tokens,
+            chunk_overlap_lines=self.chunk_overlap_lines,
+        )
 
 
 def parse_yaml_block(text: str, block: str) -> dict[str, str]:
@@ -103,6 +133,19 @@ def _parse_float(raw: str, *, default: float, minimum: float | None = None) -> f
     if minimum is not None and v <= minimum:
         return default
     return v
+
+
+def _parse_nonneg_float(raw: str, *, default: float) -> float:
+    try:
+        v = float(raw.strip())
+    except ValueError:
+        return default
+    return v if v >= 0.0 else default
+
+
+def _parse_originals(raw: str, *, default: str) -> str:
+    v = raw.strip().lower()
+    return v if v in VALID_ORIGINALS_MODES else default
 
 
 def _parse_threshold(raw: str, *, default: float) -> float:
@@ -182,6 +225,7 @@ def load_telescope_settings(config_yaml_text: str) -> TelescopeSettings:
     ret = parse_yaml_block(config_yaml_text, "retrieval")
     proc = parse_yaml_block(config_yaml_text, "process")
     paths = parse_yaml_block(config_yaml_text, "paths")
+    cal = parse_yaml_block(config_yaml_text, "calibrate")
 
     semantic_candidate_top_k = _parse_int(
         ret.get("semantic_candidate_top_k", ""),
@@ -261,6 +305,30 @@ def load_telescope_settings(config_yaml_text: str) -> TelescopeSettings:
     jina_grep_bin = _optional_path(paths.get("jina_grep_bin", ""))
     rg_bin = _optional_path(paths.get("rg_bin", ""))
 
+    chunk_tokens = _parse_int(
+        ret.get("chunk_tokens", ""), default=DEFAULT_CHUNK_TOKENS, minimum=20
+    )
+    min_chunk_tokens = _parse_int(
+        ret.get("min_chunk_tokens", ""), default=DEFAULT_MIN_CHUNK_TOKENS, minimum=0
+    )
+    if min_chunk_tokens >= chunk_tokens:
+        min_chunk_tokens = min(DEFAULT_MIN_CHUNK_TOKENS, chunk_tokens // 2)
+    chunk_overlap_lines = _parse_int(
+        ret.get("chunk_overlap_lines", ""), default=DEFAULT_CHUNK_OVERLAP_LINES, minimum=0
+    )
+    lexical_top_k = _parse_int(
+        ret.get("lexical_top_k", ""), default=DEFAULT_LEXICAL_TOP_K, minimum=1
+    )
+    rrf_k = _parse_int(ret.get("rrf_k", ""), default=DEFAULT_RRF_K, minimum=1)
+    exact_boost = _parse_nonneg_float(ret.get("exact_boost", ""), default=DEFAULT_EXACT_BOOST)
+    card_boost = _parse_nonneg_float(ret.get("card_boost", ""), default=DEFAULT_CARD_BOOST)
+    stale_after_days = _parse_int(
+        ret.get("stale_after_days", ""), default=DEFAULT_STALE_AFTER_DAYS, minimum=1
+    )
+    calibrate_originals = _parse_originals(
+        cal.get("originals", ""), default=DEFAULT_ORIGINALS_MODE
+    )
+
     return TelescopeSettings(
         semantic_candidate_top_k=semantic_candidate_top_k,
         semantic_similarity_threshold=semantic_similarity_threshold,
@@ -281,4 +349,13 @@ def load_telescope_settings(config_yaml_text: str) -> TelescopeSettings:
         embedding_allow_remote=embedding_allow_remote,
         max_file_bytes=max_file_bytes,
         max_chunk_rows=max_chunk_rows,
+        chunk_tokens=chunk_tokens,
+        min_chunk_tokens=min_chunk_tokens,
+        chunk_overlap_lines=chunk_overlap_lines,
+        lexical_top_k=lexical_top_k,
+        rrf_k=rrf_k,
+        exact_boost=exact_boost,
+        card_boost=card_boost,
+        stale_after_days=stale_after_days,
+        calibrate_originals=calibrate_originals,
     )

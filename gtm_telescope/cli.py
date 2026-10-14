@@ -13,9 +13,7 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
-from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager, suppress
-from dataclasses import dataclass
 from datetime import datetime, timezone
 from functools import lru_cache
 from pathlib import Path
@@ -28,17 +26,14 @@ except ImportError:  # pragma: no cover - Windows / minimal builds
 
 from dotenv import load_dotenv
 
-from gtm_telescope import evaluation, vector_cache
+from gtm_telescope import corpus, evaluation, retrieval, vector_cache
 from gtm_telescope.calibrate import calibrate_corpus
 from gtm_telescope.config import (
     TelescopeSettings,
     load_telescope_settings,
     parse_yaml_block,
 )
-
-ANSI_ESCAPE_RE = re.compile(r"\x1b\[[0-9;]*m")
-# path:lineno:rest (non-greedy path for typical POSIX corpus paths without ':' in names)
-GREP_RECORD_RE = re.compile(r"^(?P<file>.+?):(?P<lineno>\d+):(?P<content>.*)$")
+from gtm_telescope.retrieval import Hit
 
 _PYPROJECT_NAME_RE = re.compile(
     r"^\s*name\s*=\s*[\"']gtm-telescope[\"']",
@@ -232,10 +227,12 @@ def data_storage_dir(storage: dict[str, str] | None = None) -> Path:
 
 
 # Corpus files for lens focus/render: Markdown or UTF-8 plain text only (see lens calibrate).
-_MARKDOWN_OR_TEXT_SUFFIXES = frozenset({".md", ".markdown", ".txt"})
-_SKIP_CORPUS_NOISE_NAMES_LOWER = frozenset({".ds_store", "thumbs.db"})
+_MARKDOWN_OR_TEXT_SUFFIXES = corpus.CORPUS_SUFFIXES
+_SKIP_CORPUS_NOISE_NAMES_LOWER = frozenset(
+    {".ds_store", "thumbs.db", ".gtm_telescope_bootstrap_prefetch_ok"}
+)
 # Tool-managed directories to ignore during corpus validation (e.g. vector cache DB).
-_SKIP_CORPUS_DIRS = frozenset({".lens-cache"})
+_SKIP_CORPUS_DIRS = corpus.SKIP_CORPUS_DIRS
 
 
 def _first_non_markdown_or_txt_file_under(data: Path) -> Path | None:
@@ -267,6 +264,11 @@ def _first_non_markdown_or_txt_file_under(data: Path) -> Path | None:
                     if entry.name.lower() in _SKIP_CORPUS_NOISE_NAMES_LOWER:
                         continue
                     suf = Path(entry.name).suffix.lower()
+                    if suf in corpus.CONVERTIBLE_SUFFIXES and Path(entry.path).with_suffix(
+                        ".md"
+                    ).is_file():
+                        # calibrate.originals: keep leaves the source next to its converted .md
+                        continue
                     if suf not in _MARKDOWN_OR_TEXT_SUFFIXES:
                         return Path(entry.path)
         except OSError:
@@ -300,6 +302,13 @@ def _require_calibrated_vector_cache(data: Path) -> None:
         sys.stderr.write(
             "error: no vector cache. Run `lens calibrate` to convert documents and build "
             "the index, then run this command again.\n"
+        )
+        sys.exit(1)
+    if not info.get("schema_ok", True):
+        sys.stderr.write(
+            "error: the vector cache was built by an older version (schema "
+            f"v{(info.get('meta') or {}).get('schema_version', '?')}). "
+            "Run `lens calibrate` to rebuild the index, then run this command again.\n"
         )
         sys.exit(1)
     chunks = int(info.get("chunk_rows") or 0)
@@ -416,166 +425,26 @@ def usage() -> None:
     )
 
 
-def _strip_ansi(s: str) -> str:
-    return ANSI_ESCAPE_RE.sub("", s)
-
-
-def _parse_path_line_content(line: str) -> tuple[str, int, str] | None:
-    line = _strip_ansi(line)
-    m = GREP_RECORD_RE.match(line)
-    if not m:
-        return None
-    return m.group("file"), int(m.group("lineno")), m.group("content")
-
-
-def _norm_path_key(data: Path, filepath: str) -> str:
-    p = Path(filepath)
-    if p.is_absolute():
-        return str(p.resolve())
-    return str((data / p).resolve())
-
-
-def _display_path(path_key: str, root: Path) -> str:
-    try:
-        rel = Path(path_key).resolve().relative_to(root.resolve())
-        return str(rel)
-    except ValueError:
-        return Path(path_key).name
-
-
-def _run_rg_lexical(query: str, data: Path) -> list[tuple[str, int, str]]:
-    s = _ts()
-    cmd = [
-        rg_executable(),
-        "-i",
-        "-n",
-        "-F",
-        "--color",
-        "never",
-        "--no-heading",
-        "--",
-        query,
-        ".",
-    ]
-    try:
-        proc = subprocess.run(
-            cmd,
-            cwd=str(data),
-            check=False,
-            capture_output=True,
-            text=True,
-            timeout=s.subprocess_timeout,
-        )
-    except FileNotFoundError:
-        sys.stderr.write("error: failed to execute ripgrep (rg)\n")
-        sys.exit(1)
-    except subprocess.TimeoutExpired:
-        sys.stderr.write(
-            f"error: ripgrep (rg) timed out after {s.subprocess_timeout}s; "
-            "raise process.subprocess_timeout in config.yaml or narrow your corpus\n"
-        )
-        sys.exit(1)
-    if proc.returncode not in (0, 1):
-        sys.stderr.write(proc.stderr or proc.stdout or "error: ripgrep failed\n")
-        sys.exit(proc.returncode or 1)
-    out: list[tuple[str, int, str]] = []
-    for raw in (proc.stdout or "").splitlines():
-        if not raw.strip():
-            continue
-        parsed = _parse_path_line_content(raw)
-        if parsed:
-            out.append(parsed)
-        if len(out) >= s.lexical_max_lines:
-            break
-    return out
-
-
-@dataclass
-class _MergedRow:
-    file_display: str
-    line: int
-    source: str
-    score: float | None
-    detected: str
-    path_key: str = ""
-
-
-def _is_boilerplate_snippet(text: str) -> bool:
-    """Heuristic drop for legal/marketing footers and link dumps repeated across many files."""
-    t = text.casefold()
-    if len(t.strip()) < 8:
-        return True
-    needles = (
-        "all rights reserved",
-        "privacy policy",
-        "cookie policy",
-        "terms of use",
-        "terms of service",
-        "follow us on linkedin",
-        "follow us on twitter",
-        "subscribe to our newsletter",
-        "unsubscribe",
-        "do not sell my personal information",
-        "trademarks are the property",
-        "patent pending",
-        "© ",
-        "(c) 19",
-        "(c) 20",
-        "linkedin.com/company",
-        "twitter.com/",
-        "facebook.com/",
-        "share on facebook",
-        "share this article",
-        "for more information, visit",
-        "schedule a demo",
-        "contact sales",
-    )
-    if any(n in t for n in needles):
-        return True
-    return t.count("http://") + t.count("https://") >= 3
-
-
-def _snippet_dedupe_key(text: str) -> str:
-    return " ".join(text.split()).casefold()[:600]
-
-
-def _refine_merged_hits(merged: list[_MergedRow], *, score_floor: float) -> list[_MergedRow]:
-    """Drop boilerplate, weak scored lines, and near-duplicate bodies; cap length."""
-    s = _ts()
-    kept: list[_MergedRow] = []
-    for row in merged:
-        if _is_boilerplate_snippet(row.detected):
-            continue
-        if row.score is not None and row.score < score_floor:
-            continue
-        kept.append(row)
-
-    def sort_key(r: _MergedRow) -> tuple[int, float, str, int]:
-        if r.score is None:
-            return (0, -1.0, r.file_display, r.line)
-        return (1, r.score, r.file_display, r.line)
-
-    kept.sort(key=sort_key, reverse=True)
-
-    out: list[_MergedRow] = []
-    seen: set[str] = set()
-    for row in kept:
-        dk = _snippet_dedupe_key(row.detected)
-        if len(dk) < 15:
-            continue
-        if dk in seen:
-            continue
-        seen.add(dk)
-        out.append(row)
-        if len(out) >= s.hybrid_report_max_rows:
-            break
-    return out
-
-
-def _snippet_block_lines(rank: int, file_display: str, line: int, raw: str, wrap: int) -> list[str]:
+def _snippet_block_lines(
+    rank: int,
+    file_display: str,
+    line: int,
+    raw: str,
+    wrap: int,
+    *,
+    end_line: int | None = None,
+    heading: str | None = None,
+    note: str = "",
+) -> list[str]:
     """Lines for one hit: header then wrapped body (no table markup), easy to copy."""
     para = " ".join(raw.split())
-    out: list[str] = [f"[{rank}] {file_display}:{line}"]
+    loc = f"{line}-{end_line}" if end_line and end_line != line else str(line)
+    header = f"[{rank}] {file_display}:{loc}"
+    if heading:
+        header += f" · {heading.replace(' > ', ' › ')}"
+    if note:
+        header += f"  {note}"
+    out: list[str] = [header]
     if not para:
         out.append("(empty)")
     else:
@@ -595,116 +464,39 @@ def _format_total_search_time(elapsed_s: float) -> str:
     return f"\nTotal search time: {elapsed_s:.2f}s\n\n"
 
 
-def _collect_semantic_results(query: str, data: Path) -> dict[tuple[str, int], tuple[float, str]]:
-    """Semantic side: cosine similarity on cached chunk embeddings (HTTP to embedding server)."""
-    s = _ts()
-    _ensure_embedding_server_ready(s.embedding_server_url, data)
-    try:
-        return vector_cache.collect_semantic_results(
-            query,
-            data,
-            server_url=s.embedding_server_url,
-            model=s.embedding_model,
-            dim=s.embedding_truncate_dim,
-            granularity=s.semantic_granularity,
-            threshold=s.semantic_similarity_threshold,
-            top_k=s.semantic_candidate_top_k,
-            timeout=s.embed_http_timeout,
-            max_file_bytes=s.max_file_bytes,
-            max_chunk_rows=s.max_chunk_rows,
-        )
-    except (urllib.error.URLError, OSError, TimeoutError, json.JSONDecodeError, KeyError) as e:
-        sys.stderr.write(f"error: vector cache search failed: {e}\n")
-        sys.exit(1)
-
-
-def hybrid_search_rows(
-    query: str, storage: dict[str, str] | None = None
-) -> tuple[list[_MergedRow], float]:
-    """Lexical ripgrep + cosine-ranked cached embeddings merged into ranked rows.
-
-    Returns (rows, wall-clock seconds for the search phase). Shared by ``focus``/``render``
-    (via :func:`hybrid_search_report`) and ``eval``.
-    """
+def retrieve_hits(query: str, storage: dict[str, str] | None = None) -> tuple[list[Hit], float]:
+    """Run hybrid retrieval over the calibrated cache. Returns (hits, wall-clock seconds)."""
     s = _ts()
     data = data_storage_dir(storage)
     if not data.is_dir():
         sys.stderr.write(f"error: data storage path not a directory: {data}\n")
         sys.exit(1)
-    root = project_root()
     t0 = time.perf_counter()
-
-    with ThreadPoolExecutor(max_workers=2) as pool:
-        lexical_fut = pool.submit(_run_rg_lexical, query, data)
-        sem_fut = pool.submit(_collect_semantic_results, query, data)
-        lexical = lexical_fut.result()
-        semantic_by_key = sem_fut.result()
-
-    merged: list[_MergedRow] = []
-
-    for fp, ln, lx_content in lexical:
-        nk = _norm_path_key(data, fp)
-        key = (nk, ln)
-        disp = _display_path(nk, root)
-        if key in semantic_by_key:
-            score, sem_snip = semantic_by_key.pop(key)
-            snippet = sem_snip if len(sem_snip) > len(lx_content) else lx_content
-            merged.append(
-                _MergedRow(
-                    file_display=disp,
-                    line=ln,
-                    source="dual",
-                    score=score,
-                    detected=snippet,
-                    path_key=nk,
-                )
-            )
-        else:
-            merged.append(
-                _MergedRow(
-                    file_display=disp,
-                    line=ln,
-                    source="lexical",
-                    score=None,
-                    detected=lx_content,
-                    path_key=nk,
-                )
-            )
-
-    remainder = sorted(semantic_by_key.items(), key=lambda kv: -kv[1][0])
-    for (nk, ln), (score, snip) in remainder:
-        merged.append(
-            _MergedRow(
-                file_display=_display_path(nk, root),
-                line=ln,
-                source="semantic",
-                score=score,
-                detected=snip,
-                path_key=nk,
-            )
-        )
-
-    merged = _refine_merged_hits(merged, score_floor=s.semantic_similarity_threshold)
-
-    return merged, time.perf_counter() - t0
+    _ensure_embedding_server_ready(s.embedding_server_url, data)
+    try:
+        hits = retrieval.retrieve(query, data, s, rg_resolver=rg_executable)
+    except retrieval.RetrievalError as e:
+        sys.stderr.write(f"error: {e}\n")
+        sys.exit(1)
+    except (urllib.error.URLError, OSError, TimeoutError, json.JSONDecodeError, KeyError) as e:
+        sys.stderr.write(f"error: vector cache search failed: {e}\n")
+        sys.exit(1)
+    return hits, time.perf_counter() - t0
 
 
-def hybrid_search_report(query: str, storage: dict[str, str] | None = None) -> tuple[str, float]:
-    """Hybrid search rendered as a table + snippets.
-
-    Returns (report text without timing footer, wall-clock seconds for the search phase).
-    """
+def format_hits_report(hits: list[Hit]) -> str:
+    """Rank table plus copy-friendly snippet blocks (``(no hits)`` when empty)."""
     s = _ts()
-    merged, elapsed = hybrid_search_rows(query, storage)
-    if not merged:
-        return "(no hits)\n", elapsed
-
-    headers = ("Rank", "File", "Line", "Source", "Score")
+    if not hits:
+        return "(no hits)\n"
+    headers = ("Rank", "File", "Lines", "Source", "RRF", "Cos", "Date")
     n_col = len(headers)
     table_rows: list[tuple[str, ...]] = []
-    for i, row in enumerate(merged, start=1):
-        score_s = f"{row.score:.3f}" if row.score is not None else "—"
-        table_rows.append((str(i), row.file_display, str(row.line), row.source, score_s))
+    for i, h in enumerate(hits, start=1):
+        lines = f"{h.line_no}-{h.end_line}" if h.end_line != h.line_no else str(h.line_no)
+        cos = f"{h.cos:.3f}" if h.cos is not None else "—"
+        date_s = (h.doc_date or "—") + (" ⚠ stale" if h.stale else "")
+        table_rows.append((str(i), h.path, lines, h.source, f"{h.rrf_score:.4f}", cos, date_s))
 
     widths = [len(headers[j]) for j in range(n_col)]
     for tr in table_rows:
@@ -715,27 +507,33 @@ def hybrid_search_report(query: str, storage: dict[str, str] | None = None) -> t
         return " | ".join(cells[j].ljust(widths[j]) for j in range(n_col))
 
     sep = "-+-".join("-" * widths[j] for j in range(n_col))
-    lines_out: list[str] = []
-    lines_out.append(fmt_row(headers))
-    lines_out.append(sep)
-    for tr in table_rows:
-        lines_out.append(fmt_row(tr))
+    lines_out: list[str] = [fmt_row(headers), sep]
+    lines_out.extend(fmt_row(tr) for tr in table_rows)
     lines_out.append("")
     lines_out.append(
         f"Snippets (top {s.hybrid_report_snippet_blocks} by rank; plain text; copy blocks below)"
     )
     lines_out.append("-" * 72)
-    for i, row in enumerate(merged[: s.hybrid_report_snippet_blocks], start=1):
+    for i, h in enumerate(hits[: s.hybrid_report_snippet_blocks], start=1):
         lines_out.extend(
             _snippet_block_lines(
                 i,
-                row.file_display,
-                row.line,
-                row.detected,
+                h.path,
+                h.line_no,
+                h.text,
                 s.hybrid_report_snippet_wrap,
+                end_line=h.end_line,
+                heading=h.heading,
+                note="⚠ stale" if h.stale else "",
             )
         )
-    return "\n".join(lines_out), elapsed
+    return "\n".join(lines_out)
+
+
+def hybrid_search_report(query: str, storage: dict[str, str] | None = None) -> tuple[str, float]:
+    """Retrieve and format as a table report. Returns (report, wall-clock seconds)."""
+    hits, elapsed = retrieve_hits(query, storage)
+    return format_hits_report(hits), elapsed
 
 
 def cmd_start(argv: list[str]) -> None:
@@ -852,13 +650,6 @@ def _parse_eval_args(argv: list[str]) -> tuple[Path, list[int], bool]:
     return path, ks, as_json
 
 
-def _rel_to_data(path_key: str, data: Path) -> str:
-    try:
-        return Path(path_key).resolve().relative_to(data.resolve()).as_posix()
-    except ValueError:
-        return Path(path_key).name
-
-
 def cmd_eval(argv: list[str]) -> None:
     """Run golden questions through the same retrieval path as ``focus`` (no LLM)."""
     path, ks, as_json = _parse_eval_args(argv)
@@ -873,8 +664,8 @@ def cmd_eval(argv: list[str]) -> None:
     _require_markdown_or_text_corpus(data)
 
     def search(q: str) -> list[str]:
-        rows, _ = hybrid_search_rows(q, storage)
-        return [_rel_to_data(r.path_key, data) for r in rows]
+        hits, _ = retrieve_hits(q, storage)
+        return [h.path for h in hits]
 
     results = evaluation.evaluate(questions, search)
     summary = evaluation.summarize(results, ks)
@@ -958,7 +749,7 @@ def cmd_calibrate(argv: list[str]) -> None:
     _, storage = load_config(config_path())
     data = data_storage_dir(storage)
     root = project_root()
-    rc = calibrate_corpus(data, repo_root=root)
+    rc = calibrate_corpus(data, repo_root=root, originals=_ts().calibrate_originals)
     if rc == 0:
         sys.stderr.write(
             "lens calibrate: building / refreshing vector cache — this can take several minutes…\n"
@@ -975,6 +766,7 @@ def cmd_calibrate(argv: list[str]) -> None:
                 granularity=s.semantic_granularity,
                 timeout=s.embed_http_timeout,
                 max_file_bytes=s.max_file_bytes,
+                chunk_params=s.chunk_params,
             )
             sys.stderr.write(f"cache: refreshed {files} file(s), {chunks} chunk(s)\n")
         except (urllib.error.URLError, OSError, TimeoutError, json.JSONDecodeError, KeyError) as e:
@@ -1024,6 +816,9 @@ def cmd_cache_info(argv: list[str]) -> None:
     sys.stdout.write(f"Task:              {meta.get('task', '—')}\n")
     sys.stdout.write(f"Granularity:       {meta.get('granularity', '—')}\n")
     sys.stdout.write(f"Dim:               {meta.get('dim', '—')}\n")
+    sys.stdout.write(
+        f"Lexical index:     {'SQLite FTS5' if info.get('fts5') else 'ripgrep fallback'}\n"
+    )
     sys.stdout.write(f"Indexed files:     {info.get('file_rows', 0)}\n")
     sys.stdout.write(f"Chunks:            {info.get('chunk_rows', 0)}\n")
     sys.stdout.write(f"Vector blob bytes: {info.get('vector_bytes', 0)}\n")
@@ -1056,8 +851,9 @@ def cmd_render(argv: list[str]) -> None:
             f"see .env.example and config.yaml llm.api_key_env)\n"
         )
         sys.exit(1)
-    hits, search_s = hybrid_search_report(q, storage)
-    if hits.startswith("(no hits)"):
+    hit_list, search_s = retrieve_hits(q, storage)
+    hits = format_hits_report(hit_list)
+    if not hit_list:
         sys.stdout.write(
             "No substantive corpus excerpts passed retrieval filters for this question. "
             "Try a narrower query, add or adjust source documents, or lower "

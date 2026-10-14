@@ -10,6 +10,7 @@ import pytest
 import gtm_telescope.cli as cli
 from gtm_telescope import evaluation
 from gtm_telescope.evaluation import Question
+from gtm_telescope.retrieval import Hit
 
 
 def _q(q: str, expect: list[str], tags: list[str] | None = None) -> Question:
@@ -108,7 +109,7 @@ def test_report_and_json_shapes() -> None:
     assert payload["questions"][1]["negative"] is True
 
 
-def test_cmd_eval_uses_hybrid_rows_and_exits_zero(
+def test_cmd_eval_uses_retrieve_hits_and_exits_zero(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
     data = tmp_path / "data"
@@ -124,18 +125,23 @@ def test_cmd_eval_uses_hybrid_rows_and_exits_zero(
     monkeypatch.setattr(cli, "_require_calibrated_vector_cache", lambda _d: None)
     monkeypatch.setattr(cli, "_require_markdown_or_text_corpus", lambda _d: None)
 
-    def fake_rows(q: str, _storage: object = None) -> tuple[list[cli._MergedRow], float]:
-        row = cli._MergedRow(
-            file_display="x",
-            line=1,
+    def fake_hits(q: str, _storage: object = None) -> tuple[list[Hit], float]:
+        hit = Hit(
+            path="sub/a.md",
+            line_no=1,
+            end_line=1,
+            heading=None,
+            text="t",
+            rrf_score=0.03,
+            cos=0.5,
+            bm25=None,
             source="semantic",
-            score=0.5,
-            detected="t",
-            path_key=str((data / "sub" / "a.md").resolve()),
+            doc_date=None,
+            doc_type=None,
         )
-        return ([row] if q == "alpha" else [row]), 0.0
+        return [hit], 0.0
 
-    monkeypatch.setattr(cli, "hybrid_search_rows", fake_rows)
+    monkeypatch.setattr(cli, "retrieve_hits", fake_hits)
     cli.cmd_eval(["--file", str(qfile), "--k", "1,3", "--json"])
     out = json.loads(capsys.readouterr().out)
     assert out["metrics"]["ks"] == [1, 3]

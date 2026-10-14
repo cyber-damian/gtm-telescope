@@ -108,8 +108,9 @@ def test_cache_info_and_clear(tmp_path: Path) -> None:
     )
     blob = vector_cache._vector_to_blob(np.array([0.0, 1.0, 0.0], dtype=np.float32))
     conn.execute(
-        "INSERT INTO chunks(path, idx, line_no, text, vector) VALUES (?,?,?,?,?)",
-        (p, 0, 1, "snippet", blob),
+        "INSERT INTO chunks(path, idx, line_no, end_line, heading, text, vector) "
+        "VALUES (?,?,?,?,?,?,?)",
+        (p, 0, 1, 1, None, "snippet", blob),
     )
     conn.commit()
     conn.close()
