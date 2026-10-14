@@ -27,6 +27,8 @@ DEFAULT_RRF_K = 60
 DEFAULT_EXACT_BOOST = 0.02
 DEFAULT_CARD_BOOST = 0.01
 DEFAULT_STALE_AFTER_DAYS = 365
+DEFAULT_RENDER_MAX_CHUNKS = 8
+DEFAULT_BATCH_LOW_RRF = 0.02
 VALID_ORIGINALS_MODES = frozenset({"move", "keep", "delete"})
 DEFAULT_ORIGINALS_MODE = "move"
 DEFAULT_LEXICAL_MAX_LINES = 500
@@ -77,6 +79,8 @@ class TelescopeSettings:
     exact_boost: float
     card_boost: float
     stale_after_days: int
+    render_max_chunks: int
+    batch_low_rrf: float
     calibrate_originals: str
 
     @property
@@ -325,6 +329,12 @@ def load_telescope_settings(config_yaml_text: str) -> TelescopeSettings:
     stale_after_days = _parse_int(
         ret.get("stale_after_days", ""), default=DEFAULT_STALE_AFTER_DAYS, minimum=1
     )
+    render_max_chunks = _parse_int(
+        ret.get("render_max_chunks", ""), default=DEFAULT_RENDER_MAX_CHUNKS, minimum=1
+    )
+    batch_low_rrf = _parse_nonneg_float(
+        ret.get("batch_low_rrf", ""), default=DEFAULT_BATCH_LOW_RRF
+    )
     calibrate_originals = _parse_originals(
         cal.get("originals", ""), default=DEFAULT_ORIGINALS_MODE
     )
@@ -357,5 +367,7 @@ def load_telescope_settings(config_yaml_text: str) -> TelescopeSettings:
         exact_boost=exact_boost,
         card_boost=card_boost,
         stale_after_days=stale_after_days,
+        render_max_chunks=render_max_chunks,
+        batch_low_rrf=batch_low_rrf,
         calibrate_originals=calibrate_originals,
     )

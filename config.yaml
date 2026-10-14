@@ -1,7 +1,12 @@
-# Default LLM configuration
+# LLM used by `lens render`. Defaults to a LOCAL OpenAI-compatible server, so nothing leaves
+# the machine. Ollama: http://localhost:11434/v1   LM Studio: http://localhost:1234/v1
+# Hosted (opt-in, e.g. OpenAI): base_url "https://api.openai.com/v1", model "gpt-4.1-mini",
+# and set the key named by api_key_env in .env. Only the question and the retrieved excerpts
+# are sent to a hosted endpoint.
 llm:
-  base_url: "https://api.openai.com/v1"
-  model: "gpt-4.1-mini"
+  base_url: "http://localhost:11434/v1"
+  model: "llama3.1:8b"
+  # Only required for non-localhost endpoints
   api_key_env: "OPENAI_API_KEY"
   env_file: ".env"
 
@@ -43,6 +48,10 @@ retrieval:
   card_boost: "0.01"
   # Hits older than this are flagged "stale" (never demoted in ranking)
   stale_after_days: "365"
+  # lens render: how many top chunks (full text) the LLM receives
+  render_max_chunks: "8"
+  # lens render --batch: confidence is "low" when the top fused score is below this
+  batch_low_rrf: "0.02"
   # Limit results to 10 rows
   hybrid_report_max_rows: "10"
   # Show 3 blocks of context in the report

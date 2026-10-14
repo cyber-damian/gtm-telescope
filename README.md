@@ -20,7 +20,7 @@ There are two distinct ways you can use telescope:
 
 `lens focus <query>`: Instantly resolves the most relevant technical snippets, file locations, and line numbers.
 
-`lens render <query>`: Generate an LLM based response grounded entirely in your "focused" data.
+`lens render <query>`: Generate a **cited** answer grounded entirely in your "focused" data. Every claim carries `[n]` markers and a `Sources:` block maps them to `path:line-end_line`. If the docs do not cover the question, the answer says `Not covered in the docs: ...`. By default it uses a **local** model (Ollama), so nothing leaves your machine.
 
 **Note:** run **`lens calibrate`** after adding or changing documents (it converts PDF and supported Office files to Markdown and refreshes the vector index). Then use **`lens focus`** / **`lens render`**.
 
@@ -51,7 +51,7 @@ All tunables and paths are read from [`config.yaml`](config.yaml). Secrets for *
 
 | Block | Purpose |
 |-------|---------|
-| `llm` | LLM endpoint, model, `api_key_env` (variable name populated from `.env`), optional `env_file` |
+| `llm` | LLM endpoint, model (default: local Ollama `llama3.1:8b`), `api_key_env` (only needed for non-localhost endpoints), optional `env_file` |
 | `storage` | `data_dir` for corpus files |
 | `embedding` | `server_url`, `model`, optional `truncate_dim`, timeouts, `max_file_bytes`, optional `allow_remote` |
 | `retrieval` | Semantic `top_k`, `semantic_threshold`, `semantic_granularity`, `max_chunk_rows`, hybrid report layout, chunking, lexical and fusion tuning (table below) |
@@ -74,6 +74,8 @@ All tunables and paths are read from [`config.yaml`](config.yaml). Secrets for *
 | `exact_boost` | `0.02` | Added when a chunk contains every quoted phrase (or every term of a query with 3 terms or fewer) |
 | `card_boost` | `0.01` | Added to chunks whose frontmatter `type` is `card` (no effect until cards exist) |
 | `stale_after_days` | `365` | Hits whose document date is older are flagged `⚠ stale` (not demoted) |
+| `render_max_chunks` | `8` | `lens render`: number of top chunks (full text) sent to the LLM |
+| `batch_low_rrf` | `0.02` | `lens render`: confidence is `low` when the top fused score is below this |
 | `hybrid_report_max_rows` | `10` | Maximum results |
 
 Changing the chunking keys or `semantic_granularity` re-indexes the corpus on the next `lens calibrate`.
@@ -166,12 +168,25 @@ It prints the rank of the first expected file per question (or `miss`), then **R
 | `lens status` | Show embedding server status + configured URL/port |
 | `lens calibrate` | Convert PDF/Office → Markdown; refresh vector cache |
 | `lens focus <text>` | Hybrid search engine |
-| `lens render <text>` | LLM generative response |
+| `lens render [--json] <text>` | Cited LLM answer (`[n]` markers + `Sources:` block); `--json` prints `{answer, citations, confidence, elapsed_ms}` |
+| `lens render --batch FILE [--question-col NAME] [--out FILE] [--sheet NAME]` | Answer every row of a CSV/XLSX questionnaire (see below) |
 | `lens eval [--file F] [--k 3,10] [--json]` | Run golden questions ([`eval/questions.yaml`](eval/questions.yaml)) through the `focus` retrieval path; prints Recall@k and MRR |
 | `lens cache info` | Vector cache statistics |
 | `lens cache clear` | Remove vector cache on disk |
 
-For **`render`**, set variables in **`.env`** (see `llm.api_key_env` and `llm.env_file` in [`config.yaml`](config.yaml)).
+### `lens render`: local LLM by default
+
+`config.yaml` points `llm.base_url` at `http://localhost:11434/v1` (Ollama) with `llama3.1:8b`; run `ollama pull llama3.1:8b` once. LM Studio (`http://localhost:1234/v1`) works the same way. **No API key is required for localhost endpoints.**
+
+Hosted models (for example OpenAI) are **opt-in**: set `llm.base_url: "https://api.openai.com/v1"`, a model name, and put the key named by `llm.api_key_env` in **`.env`** (see [`.env.example`](.env.example)). Remote endpoints must use `https://`. What is sent to a hosted endpoint: the question and the top `render_max_chunks` retrieved excerpts (with their file paths and dates), plus the system prompt. Nothing else from your corpus is sent.
+
+Post-processing is deterministic: citations outside the provided sources are removed, a `Sources:` block is added, an answer with no valid citation is prefixed `⚠ Uncited answer — verify before sending.`, and stale cited sources are annotated `(verify: source dated <date>)`.
+
+### Batch questionnaires
+
+`lens render --batch questions.csv` (or `.xlsx`, which needs `pip install '.[batch]'`) answers each row and writes `questions.answers.csv` next to the input (override with `--out`). The question column is `--question-col`, else the first header containing "question", "requirement" or "query", else the first column. Input columns are passed through and four are appended: `answer`, `citations` (`path:lines; ...`), `confidence`, `stale_sources`. Progress goes to stderr, and the output is rewritten after every row, so an interrupted run **resumes** when you re-run the same command (rows whose `answer` is filled are kept).
+
+`confidence` values: `not_covered` (the model said so, or nothing was retrieved); `high` (at least two distinct cited sources and the top hit is `dual`, or has cosine ≥ `semantic_threshold + 0.15`); `low` (no valid citation, or top fused score < `batch_low_rrf`); otherwise `medium`. Review `low` and `not_covered` rows by hand.
 
 ## License
 

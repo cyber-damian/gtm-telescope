@@ -14,10 +14,10 @@ import urllib.error
 import urllib.parse
 import urllib.request
 from contextlib import contextmanager, suppress
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from functools import lru_cache
 from pathlib import Path
-from typing import Any
 
 try:
     import fcntl
@@ -27,12 +27,15 @@ except ImportError:  # pragma: no cover - Windows / minimal builds
 from dotenv import load_dotenv
 
 from gtm_telescope import corpus, evaluation, retrieval, vector_cache
+from gtm_telescope import llm as llm_mod
+from gtm_telescope.batch import BatchError, run_batch
 from gtm_telescope.calibrate import calibrate_corpus
 from gtm_telescope.config import (
     TelescopeSettings,
     load_telescope_settings,
     parse_yaml_block,
 )
+from gtm_telescope.render import RenderResult, render_from_hits
 from gtm_telescope.retrieval import Hit
 
 _PYPROJECT_NAME_RE = re.compile(
@@ -415,7 +418,9 @@ def usage() -> None:
         f"  {prog} stop\n"
         f"  {prog} status\n"
         f"  {prog} focus <natural language query>\n"
-        f"  {prog} render <natural language query>\n"
+        f"  {prog} render [--json] <natural language query>\n"
+        f"  {prog} render --batch FILE.csv|FILE.xlsx [--question-col NAME] [--out FILE] "
+        "[--sheet NAME]\n"
         f"  {prog} calibrate\n"
         f"  {prog} eval [--file eval/questions.yaml] [--k 3,10] [--json]\n"
         f"  {prog} cache clear\n"
@@ -677,67 +682,19 @@ def cmd_eval(argv: list[str]) -> None:
 
 
 def chat_completion(base_url: str, model: str, api_key: str, user_content: str) -> str:
-    base = base_url.rstrip("/")
-    if not base.lower().startswith("https://"):
-        if base.lower().startswith("http://localhost") or base.lower().startswith(
-            "http://127.0.0.1"
-        ):
+    """Thin CLI wrapper over :func:`llm.chat_completion` (errors -> stderr + exit 1)."""
+    try:
+        llm_mod.validate_base_url(base_url)
+        if api_key and base_url.lower().startswith("http://"):
             sys.stderr.write(
-                f"warning: llm.base_url uses plaintext http:// ({base!r}); "
+                f"warning: llm.base_url uses plaintext http:// ({base_url!r}); "
                 "API key will be sent unencrypted (allowed for local endpoints)\n"
             )
-        else:
-            sys.stderr.write(
-                f"error: llm.base_url must use https:// to protect the API key (got {base!r}). "
-                "Set an https:// URL in config.yaml, or use http://localhost / http://127.0.0.1 "
-                "for explicit local testing.\n"
-            )
-            sys.exit(1)
-    url = f"{base}/chat/completions"
-    body: dict[str, Any] = {
-        "model": model,
-        "messages": [
-            {
-                "role": "system",
-                "content": (
-                    "You answer only from substantive facts present in the provided excerpts. "
-                    "Repeated legal/marketing footers, copyright lines, or generic 'contact us' "
-                    "blurbs are not evidence—ignore them completely. "
-                    "If the excerpts do not contain enough information to answer the question, "
-                    "say that clearly in one or two sentences and do not invent product behavior, "
-                    "integrations, or features."
-                ),
-            },
-            {"role": "user", "content": user_content},
-        ],
-    }
-    data = json.dumps(body).encode("utf-8")
-    req = urllib.request.Request(
-        url,
-        data=data,
-        method="POST",
-        headers={
-            "Content-Type": "application/json",
-            "Authorization": f"Bearer {api_key}",
-        },
-    )
-    try:
-        with urllib.request.urlopen(req, timeout=_ts().http_timeout) as resp:
-            payload = json.loads(resp.read().decode("utf-8"))
-    except urllib.error.HTTPError as e:
-        snippet = e.read()[:800].decode("utf-8", errors="replace")
-        sys.stderr.write(f"error: LLM HTTP {e.code}\n{snippet}\n")
-        sys.exit(1)
-    except urllib.error.URLError as e:
-        sys.stderr.write(f"error: LLM request failed: {e}\n")
-        sys.exit(1)
-    except json.JSONDecodeError as e:
-        sys.stderr.write(f"error: invalid JSON from LLM: {e}\n")
-        sys.exit(1)
-    try:
-        return str(payload["choices"][0]["message"]["content"])
-    except (KeyError, IndexError, TypeError):
-        sys.stderr.write(f"error: unexpected LLM response shape: {payload!r}\n")
+        return llm_mod.chat_completion(
+            base_url, model, api_key, user_content, timeout=_ts().http_timeout
+        )
+    except llm_mod.LLMError as e:
+        sys.stderr.write(f"error: {e}\n")
         sys.exit(1)
 
 
@@ -834,43 +791,122 @@ def cmd_cache_info(argv: list[str]) -> None:
         sys.stdout.write("\n")
 
 
+@dataclass(frozen=True)
+class RenderArgs:
+    question: str
+    json_out: bool = False
+    batch: str | None = None
+    question_col: str | None = None
+    out: str | None = None
+    sheet: str | None = None
+
+
+def _parse_render_args(argv: list[str]) -> RenderArgs:
+    """Parse ``render`` arguments; raises ``ValueError`` with a user-facing message."""
+    words: list[str] = []
+    opts: dict[str, str] = {}
+    json_out = False
+    value_flags = {"--batch", "--question-col", "--out", "--sheet"}
+    i = 0
+    while i < len(argv):
+        a = argv[i]
+        if a == "--json":
+            json_out = True
+        elif a in value_flags:
+            if i + 1 >= len(argv):
+                raise ValueError(f"{a} requires a value")
+            opts[a] = argv[i + 1]
+            i += 1
+        elif a.startswith("--") and len(a) > 2:
+            raise ValueError(f"unknown option {a!r} for render")
+        else:
+            words.append(a)
+        i += 1
+    ra = RenderArgs(
+        question=" ".join(words).strip(),
+        json_out=json_out,
+        batch=opts.get("--batch"),
+        question_col=opts.get("--question-col"),
+        out=opts.get("--out"),
+        sheet=opts.get("--sheet"),
+    )
+    if ra.batch is None:
+        if not ra.question:
+            raise ValueError("render needs a question (or --batch FILE)")
+        if ra.question_col or ra.out or ra.sheet:
+            raise ValueError("--question-col, --out and --sheet require --batch")
+    else:
+        if ra.question:
+            raise ValueError("--batch cannot be combined with a question argument")
+        if ra.json_out:
+            raise ValueError("--json is not supported with --batch (output is CSV/XLSX)")
+    return ra
+
+
+def _render_one(question: str, llm: dict[str, str], storage: dict[str, str]) -> RenderResult:
+    """Retrieve, ask the LLM, post-process. Exits via ``chat_completion`` on LLM errors."""
+    ts = _ts()
+    api_key = os.environ.get(llm["api_key_env"], "")
+    t0 = time.perf_counter()
+    hit_list, _ = retrieve_hits(question, storage)
+    result = render_from_hits(
+        question,
+        hit_list,
+        chat=lambda prompt: chat_completion(llm["base_url"], llm["model"], api_key, prompt),
+        max_chunks=ts.render_max_chunks,
+        semantic_threshold=ts.semantic_similarity_threshold,
+        batch_low_rrf=ts.batch_low_rrf,
+    )
+    result.elapsed_ms = (time.perf_counter() - t0) * 1000.0
+    return result
+
+
 def cmd_render(argv: list[str]) -> None:
-    q = " ".join(argv).strip()
-    if not q:
+    try:
+        ra = _parse_render_args(argv)
+    except ValueError as e:
+        sys.stderr.write(f"error: {e}\n")
         usage()
         sys.exit(2)
     llm, storage = load_config(config_path())
     data = data_storage_dir(storage)
     _require_calibrated_vector_cache(data)
     _require_markdown_or_text_corpus(data)
-    env_name = llm["api_key_env"]
-    api_key = os.environ.get(env_name, "")
-    if not api_key:
+    try:
+        llm_mod.validate_base_url(llm["base_url"])
+    except llm_mod.LLMError as e:
+        sys.stderr.write(f"error: {e}\n")
+        sys.exit(1)
+    if llm_mod.api_key_required(llm["base_url"]) and not os.environ.get(llm["api_key_env"], ""):
+        env_name = llm["api_key_env"]
         sys.stderr.write(
             f"error: set {env_name} for lens render (e.g. in repo .env via llm.env_file; "
-            f"see .env.example and config.yaml llm.api_key_env)\n"
+            f"see .env.example and config.yaml llm.api_key_env). "
+            f"A local llm.base_url (Ollama, LM Studio) needs no key.\n"
         )
         sys.exit(1)
-    hit_list, search_s = retrieve_hits(q, storage)
-    hits = format_hits_report(hit_list)
-    if not hit_list:
-        sys.stdout.write(
-            "No substantive corpus excerpts passed retrieval filters for this question. "
-            "Try a narrower query, add or adjust source documents, or lower "
-            "retrieval.semantic_threshold in config.yaml if the cutoff is too strict.\n"
-        )
-        sys.stdout.write(_format_total_search_time(search_s))
+
+    if ra.batch is not None:
+        try:
+            out = run_batch(
+                Path(ra.batch),
+                answer=lambda q: _render_one(q, llm, storage),
+                question_col=ra.question_col,
+                out_path=Path(ra.out) if ra.out else None,
+                sheet=ra.sheet,
+            )
+        except BatchError as e:
+            sys.stderr.write(f"error: {e}\n")
+            sys.exit(1)
+        sys.stdout.write(f"Wrote {out}\n")
         return
-    user_block = (
-        f"Question:\n{q}\n\n"
-        "Sources (lexical + semantic; boilerplate and weak matches removed):\n"
-        f"{hits}"
-    )
-    out = chat_completion(llm["base_url"], llm["model"], api_key, user_block)
-    sys.stdout.write(out)
-    if not out.endswith("\n"):
-        sys.stdout.write("\n")
-    sys.stdout.write(_format_total_search_time(search_s))
+
+    result = _render_one(ra.question, llm, storage)
+    if ra.json_out:
+        sys.stdout.write(result.to_json())
+        return
+    sys.stdout.write(result.full_text())
+    sys.stdout.write(_format_total_search_time(result.elapsed_ms / 1000.0))
 
 
 def main() -> None:

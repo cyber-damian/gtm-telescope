@@ -19,7 +19,11 @@ dependencies = [
 calibrate = [
   "docling>=2.10",
 ]
+batch = [
+  "openpyxl>=3.1",
+]
 dev = [
+  "openpyxl>=3.1",
   "pytest>=8",
   "ruff>=0.6",
 ]
