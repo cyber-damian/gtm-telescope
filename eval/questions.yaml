@@ -1,0 +1,66 @@
+# Golden questions for `lens eval`. Paths are relative to the data directory (data-storage/).
+# `expect`: one or more files; a hit in any of them counts. `expect: []` marks a question the
+# corpus should NOT answer (reported as an abstain rate, not recall).
+
+# --- exact-term -------------------------------------------------------------
+- q: "Do you support SCIM provisioning?"
+  expect: ["product/feature-spec-auth.md"]
+  tags: [exact-term, live]
+
+- q: 'Do you require "TLS 1.3"?'
+  expect: ["security/tls-and-encryption.md"]
+  tags: [exact-term, live]
+
+- q: "8443"
+  expect: ["security/tls-and-encryption.md"]
+  tags: [exact-term, live]
+
+- q: "INC-0000"
+  expect: ["operations/incident-contacts.md"]
+  tags: [exact-term]
+
+- q: "warm standby"
+  expect: ["operations/incident-runbook.md"]
+  tags: [exact-term, live]
+
+- q: "What is the API rate-limit on the Starter tier?"
+  expect: ["product/pricing-2023.md"]
+  tags: [exact-term, stale]
+
+- q: "GTM_TELESCOPE_LEXICAL_ONLY_MARKER_7f4c2b91"
+  expect: ["lexical-only/marker.txt"]
+  tags: [exact-term, marker]
+
+# --- semantic ---------------------------------------------------------------
+- q: "how should we handle a database outage during peak traffic"
+  expect: ["operations/incident-runbook.md"]
+  tags: [semantic, live]
+
+- q: "how do we let employees sign in with their company identity provider"
+  expect: ["product/feature-spec-auth.md"]
+  tags: [semantic, live]
+
+- q: "how often are the keys protecting customer data replaced"
+  expect: ["security/tls-and-encryption.md"]
+  tags: [semantic, live]
+
+- q: "what should we do when searching suddenly becomes slow"
+  expect: ["operations/search-latency-runbook.md"]
+  tags: [semantic, async]
+
+- q: "generated answers do not match what the documents say"
+  expect: ["operations/render-grounding-runbook.md"]
+  tags: [semantic, async]
+
+- q: "vegetarian dinner with legumes and warm spices"
+  expect: ["recipes/hearty-lentil-soup.md"]
+  tags: [semantic]
+
+# --- should not match -------------------------------------------------------
+- q: "Do you hold a FedRAMP authorization?"
+  expect: []
+  tags: [negative, live]
+
+- q: "What is the capital city of Australia?"
+  expect: []
+  tags: [negative]

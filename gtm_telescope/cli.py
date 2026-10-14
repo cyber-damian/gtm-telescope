@@ -28,7 +28,7 @@ except ImportError:  # pragma: no cover - Windows / minimal builds
 
 from dotenv import load_dotenv
 
-from gtm_telescope import vector_cache
+from gtm_telescope import evaluation, vector_cache
 from gtm_telescope.calibrate import calibrate_corpus
 from gtm_telescope.config import (
     TelescopeSettings,
@@ -408,6 +408,7 @@ def usage() -> None:
         f"  {prog} focus <natural language query>\n"
         f"  {prog} render <natural language query>\n"
         f"  {prog} calibrate\n"
+        f"  {prog} eval [--file eval/questions.yaml] [--k 3,10] [--json]\n"
         f"  {prog} cache clear\n"
         f"  {prog} cache info\n"
         "\n"
@@ -496,6 +497,7 @@ class _MergedRow:
     source: str
     score: float | None
     detected: str
+    path_key: str = ""
 
 
 def _is_boilerplate_snippet(text: str) -> bool:
@@ -616,10 +618,13 @@ def _collect_semantic_results(query: str, data: Path) -> dict[tuple[str, int], t
         sys.exit(1)
 
 
-def hybrid_search_report(query: str, storage: dict[str, str] | None = None) -> tuple[str, float]:
-    """Lexical ripgrep + cosine-ranked cached embeddings merged into a table report.
+def hybrid_search_rows(
+    query: str, storage: dict[str, str] | None = None
+) -> tuple[list[_MergedRow], float]:
+    """Lexical ripgrep + cosine-ranked cached embeddings merged into ranked rows.
 
-    Returns (report text without timing footer, wall-clock seconds for the search phase).
+    Returns (rows, wall-clock seconds for the search phase). Shared by ``focus``/``render``
+    (via :func:`hybrid_search_report`) and ``eval``.
     """
     s = _ts()
     data = data_storage_dir(storage)
@@ -651,6 +656,7 @@ def hybrid_search_report(query: str, storage: dict[str, str] | None = None) -> t
                     source="dual",
                     score=score,
                     detected=snippet,
+                    path_key=nk,
                 )
             )
         else:
@@ -661,6 +667,7 @@ def hybrid_search_report(query: str, storage: dict[str, str] | None = None) -> t
                     source="lexical",
                     score=None,
                     detected=lx_content,
+                    path_key=nk,
                 )
             )
 
@@ -673,12 +680,22 @@ def hybrid_search_report(query: str, storage: dict[str, str] | None = None) -> t
                 source="semantic",
                 score=score,
                 detected=snip,
+                path_key=nk,
             )
         )
 
     merged = _refine_merged_hits(merged, score_floor=s.semantic_similarity_threshold)
 
-    elapsed = time.perf_counter() - t0
+    return merged, time.perf_counter() - t0
+
+
+def hybrid_search_report(query: str, storage: dict[str, str] | None = None) -> tuple[str, float]:
+    """Hybrid search rendered as a table + snippets.
+
+    Returns (report text without timing footer, wall-clock seconds for the search phase).
+    """
+    s = _ts()
+    merged, elapsed = hybrid_search_rows(query, storage)
     if not merged:
         return "(no hits)\n", elapsed
 
@@ -795,6 +812,77 @@ def cmd_focus(argv: list[str]) -> None:
     report, search_s = hybrid_search_report(q, storage)
     sys.stdout.write(report)
     sys.stdout.write(_format_total_search_time(search_s))
+
+
+def _parse_eval_args(argv: list[str]) -> tuple[Path, list[int], bool]:
+    file_arg: str | None = None
+    ks = list(evaluation.DEFAULT_KS)
+    as_json = False
+    i = 0
+    try:
+        while i < len(argv):
+            a = argv[i]
+            if a == "--json":
+                as_json = True
+            elif a in ("--file", "--k"):
+                if i + 1 >= len(argv):
+                    raise ValueError(f"{a} requires a value")
+                i += 1
+                if a == "--file":
+                    file_arg = argv[i]
+                else:
+                    ks = evaluation.parse_ks(argv[i])
+            elif a.startswith("--file="):
+                file_arg = a.split("=", 1)[1]
+            elif a.startswith("--k="):
+                ks = evaluation.parse_ks(a.split("=", 1)[1])
+            else:
+                raise ValueError(f"unknown eval argument {a!r}")
+            i += 1
+    except ValueError as e:
+        sys.stderr.write(f"error: {e}\n")
+        usage()
+        sys.exit(2)
+    if file_arg is None:
+        path = project_root() / "eval" / "questions.yaml"
+    else:
+        path = Path(file_arg).expanduser()
+        if not path.is_absolute():
+            path = Path.cwd() / path
+    return path, ks, as_json
+
+
+def _rel_to_data(path_key: str, data: Path) -> str:
+    try:
+        return Path(path_key).resolve().relative_to(data.resolve()).as_posix()
+    except ValueError:
+        return Path(path_key).name
+
+
+def cmd_eval(argv: list[str]) -> None:
+    """Run golden questions through the same retrieval path as ``focus`` (no LLM)."""
+    path, ks, as_json = _parse_eval_args(argv)
+    try:
+        questions = evaluation.load_questions(path)
+    except ValueError as e:
+        sys.stderr.write(f"error: {e}\n")
+        sys.exit(1)
+    _, storage = load_config(config_path())
+    data = data_storage_dir(storage)
+    _require_calibrated_vector_cache(data)
+    _require_markdown_or_text_corpus(data)
+
+    def search(q: str) -> list[str]:
+        rows, _ = hybrid_search_rows(q, storage)
+        return [_rel_to_data(r.path_key, data) for r in rows]
+
+    results = evaluation.evaluate(questions, search)
+    summary = evaluation.summarize(results, ks)
+    if as_json:
+        sys.stdout.write(evaluation.to_json(results, summary))
+    else:
+        sys.stdout.write(evaluation.format_report(results, summary))
+    # Measurement tool, not a gate: exit code is always 0.
 
 
 def chat_completion(base_url: str, model: str, api_key: str, user_content: str) -> str:
@@ -1019,6 +1107,8 @@ def main() -> None:
         cmd_focus(rest)
     elif sub == "render":
         cmd_render(rest)
+    elif sub == "eval":
+        cmd_eval(rest)
     elif sub == "calibrate":
         cmd_calibrate(rest)
     elif sub == "cache":
