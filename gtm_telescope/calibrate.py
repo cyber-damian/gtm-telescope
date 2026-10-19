@@ -216,7 +216,7 @@ def calibrate_corpus(
         except ImportError:
             err.write(
                 "error: docling is not installed. Install the calibrate extra, e.g. "
-                "pip install '.[calibrate]' or re-run ./scripts/bootstrap.sh\n"
+                "uv sync --extra calibrate or re-run ./scripts/bootstrap.sh\n"
             )
             return 1
         converter = DocumentConverter()

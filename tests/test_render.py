@@ -168,6 +168,33 @@ def test_render_from_hits_passes_prompt_and_postprocesses() -> None:
     assert res.citations[0].location == "a.md:1-5"
 
 
+def test_strip_citation_markers() -> None:
+    assert render.strip_citation_markers("Yes [1]. Also [2][3].") == "Yes. Also."
+
+
+def test_format_sales_display_structure() -> None:
+    hits = [mk_hit("a.md", 3, 9), mk_hit("b.md", 4, 4)]
+    res = process("We support SAML [1]. SCIM too [2].", hits)
+    text = render.format_sales_display(
+        res, question="Do you support SSO?", mode="short"
+    )
+    assert "CUSTOMER QUESTION" in text
+    assert "Do you support SSO?" in text
+    assert "SAY THIS · Quick reply" in text
+    assert "MEDIUM" in text
+    assert "[1]" not in text.split("IF THEY ASK")[0]
+    assert "We support SAML. SCIM too." in text
+    assert "IF THEY ASK WHERE THIS IS FROM" in text
+    assert "a.md:3-9" in text
+
+
+def test_format_sales_display_not_covered_shows_check_section() -> None:
+    res = process("Not covered in the docs: FedRAMP.", [mk_hit()])
+    text = render.format_sales_display(res, question="FedRAMP?", mode="explain")
+    assert "NOT IN DOCS" in text
+    assert "CHECK BEFORE YOU SEND" in text
+
+
 def test_json_shape() -> None:
     res = process("A [1].", [mk_hit("a.md", 2, 6)])
     res.elapsed_ms = 12.345

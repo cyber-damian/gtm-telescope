@@ -20,22 +20,22 @@ There are two distinct ways you can use telescope:
 
 `lens focus <query>`: Instantly resolves the most relevant technical snippets, file locations, and line numbers.
 
-`lens render <query>`: Generate a **cited** answer grounded entirely in your "focused" data. Every claim carries `[n]` markers and a `Sources:` block maps them to `path:line-end_line`. If the docs do not cover the question, the answer says `Not covered in the docs: ...`. By default it uses a **local** model (Ollama), so nothing leaves your machine.
+`lens render <query>`: Generate a **cited** answer grounded entirely in your "focused" data. Every claim carries `[n]` markers and a `Sources:` block maps them to `path:line-end_line`. If the docs do not cover the question, the answer says `Not covered in the docs: ...`. Choose the style with `--short` (default), `--story` or `--explain`. It uses Claude, OpenAI or Mistral, depending on which API key you put in `.env`.
 
 **Note:** run **`lens calibrate`** after adding or changing documents (it converts PDF and supported Office files to Markdown and refreshes the vector index). Then use **`lens focus`** / **`lens render`**.
 
 ## Requirements
 
 - **macOS on Apple Silicon** - uses Apple's native Silicon-optimized MLX engine.
-- **Python 3.10+** - accessible in your PATH.
-- **uv** - (optional but recommended); otherwise the bootstrap script uses `python3 -m venv` and `pip`.
+- **Python 3.10+** - installed or managed by [uv](https://docs.astral.sh/uv/getting-started/installation/).
+- **uv** - required for setup and running `lens` (via `bin/lens` → `uv run lens`).
 
 ## Quick start
 
 ```bash
 # Setup the project
 git clone https://github.com/cyber-damian/gtm-telescope.git && cd gtm-telescope
-./scripts/bootstrap.sh
+./scripts/bootstrap.sh   # uv sync --extra calibrate, ripgrep, optional model prefetch
 export PATH="$PWD/bin:$PATH"
 cp .env.example .env
 
@@ -45,13 +45,21 @@ lens calibrate
 lens focus "your question here"
 ```
 
+Development and tests use the same environment:
+
+```bash
+uv sync --extra calibrate --extra dev --extra batch
+uv run pytest
+uv run ruff check .
+```
+
 ## Configuration
 
 All tunables and paths are read from [`config.yaml`](config.yaml). Secrets for **`lens render`** are loaded from **`.env`**.
 
 | Block | Purpose |
 |-------|---------|
-| `llm` | LLM endpoint, model (default: local Ollama `llama3.1:8b`), `api_key_env` (only needed for non-localhost endpoints), optional `env_file` |
+| `llm` | `anthropic_model`, `openai_model`, `mistral_model` (model used for each provider), `max_tokens` (answer length cap), optional `env_file` |
 | `storage` | `data_dir` for corpus files |
 | `embedding` | `server_url`, `model`, optional `truncate_dim`, timeouts, `max_file_bytes`, optional `allow_remote` |
 | `retrieval` | Semantic `top_k`, `semantic_threshold`, `semantic_granularity`, `max_chunk_rows`, hybrid report layout, chunking, lexical and fusion tuning (table below) |
@@ -97,6 +105,8 @@ The date shown for a hit is `updated`/`date`, else `source_mtime` (written by `l
 ## Data Storage 
 
 All data and documents should be put in **`data-storage/`** by default. You can change the default location in [`config.yaml`](config.yaml). There are several examples files provided to give you a feel how telescope works (remove them when you are finished learning).
+
+**`data-storage/snyk/`** is gitignored: use it for local-only corpus (for example Snyk-related docs). After adding files there, run **`lens calibrate`** so they are indexed.
 
 ### Calibrate
 
@@ -168,23 +178,47 @@ It prints the rank of the first expected file per question (or `miss`), then **R
 | `lens status` | Show embedding server status + configured URL/port |
 | `lens calibrate` | Convert PDF/Office → Markdown; refresh vector cache |
 | `lens focus <text>` | Hybrid search engine |
-| `lens render [--json] <text>` | Cited LLM answer (`[n]` markers + `Sources:` block); `--json` prints `{answer, citations, confidence, elapsed_ms}` |
-| `lens render --batch FILE [--question-col NAME] [--out FILE] [--sheet NAME]` | Answer every row of a CSV/XLSX questionnaire (see below) |
+| `lens render [--short\|--story\|--explain] [--json] <text>` | Cited LLM answer (`[n]` markers + `Sources:` block) in the chosen style (default `--short`); `--json` prints `{answer, citations, confidence, elapsed_ms}` |
+| `lens render [--short\|--story\|--explain] --batch FILE [--question-col NAME] [--out FILE] [--sheet NAME]` | Answer every row of a CSV/XLSX questionnaire (see below) |
 | `lens eval [--file F] [--k 3,10] [--json]` | Run golden questions ([`eval/questions.yaml`](eval/questions.yaml)) through the `focus` retrieval path; prints Recall@k and MRR |
 | `lens cache info` | Vector cache statistics |
 | `lens cache clear` | Remove vector cache on disk |
 
-### `lens render`: local LLM by default
+### `lens render`: providers
 
-`config.yaml` points `llm.base_url` at `http://localhost:11434/v1` (Ollama) with `llama3.1:8b`; run `ollama pull llama3.1:8b` once. LM Studio (`http://localhost:1234/v1`) works the same way. **No API key is required for localhost endpoints.**
+Copy [`.env.example`](.env.example) to `.env` and fill in one key. The provider is chosen from the keys that are set, in this order:
 
-Hosted models (for example OpenAI) are **opt-in**: set `llm.base_url: "https://api.openai.com/v1"`, a model name, and put the key named by `llm.api_key_env` in **`.env`** (see [`.env.example`](.env.example)). Remote endpoints must use `https://`. What is sent to a hosted endpoint: the question and the top `render_max_chunks` retrieved excerpts (with their file paths and dates), plus the system prompt. Nothing else from your corpus is sent.
+| Key in `.env` | Provider | Model setting in `config.yaml` |
+|---------------|----------|--------------------------------|
+| `ANTHROPIC_API_KEY` | Claude | `llm.anthropic_model` |
+| `OPENAI_API_KEY` | OpenAI | `llm.openai_model` |
+| `MISTRAL_API_KEY` | Mistral | `llm.mistral_model` |
 
-Post-processing is deterministic: citations outside the provided sources are removed, a `Sources:` block is added, an answer with no valid citation is prefixed `⚠ Uncited answer — verify before sending.`, and stale cited sources are annotated `(verify: source dated <date>)`.
+If several keys are set, the first one in the table wins. To pick a different one, set `LLM_PROVIDER=anthropic`, `openai` or `mistral`. If no key is set, `lens render` exits with an error.
+
+What is sent to the provider: the question, the top `render_max_chunks` retrieved excerpts (with their file paths and dates), and the prompt template for the chosen style. Nothing else from your corpus is sent.
+
+### `lens render`: answer styles
+
+| Flag | Output |
+|------|--------|
+| `--short` (default) | Two sentences you can send to a customer as-is |
+| `--story` | 6 to 8 sentences built around a customer story found in the retrieved sources. If none of the sources contains a story, the answer still covers the question and ends with `Not covered in the docs: no customer story found`. |
+| `--explain` | Up to two detailed paragraphs explaining the concept |
+
+```bash
+lens render --short "Do you support SCIM provisioning?"
+lens render --story "How do customers handle a database outage?"
+lens render --explain 'How does "TLS 1.3" encryption work in the platform?'
+```
+
+Each style is a separate prompt template in [`gtm_telescope/prompt_templates/`](gtm_telescope/prompt_templates/): `rules.md` holds the grounding and citation rules shared by every style, and `short.md`, `story.md` and `explain.md` add the format for each one. Edit those files to change the tone or length.
+
+Terminal output is laid out for live calls: **CUSTOMER QUESTION**, **SAY THIS** (citation markers stripped so you can read it aloud), **IF THEY ASK WHERE THIS IS FROM** (doc paths and dates), and **CHECK BEFORE YOU SEND** when confidence is low or sources are stale. Post-processing is deterministic: invalid citations are removed; uncited answers are flagged; stale sources get a verify note. Use `--json` for the raw answer text and citation objects.
 
 ### Batch questionnaires
 
-`lens render --batch questions.csv` (or `.xlsx`, which needs `pip install '.[batch]'`) answers each row and writes `questions.answers.csv` next to the input (override with `--out`). The question column is `--question-col`, else the first header containing "question", "requirement" or "query", else the first column. Input columns are passed through and four are appended: `answer`, `citations` (`path:lines; ...`), `confidence`, `stale_sources`. Progress goes to stderr, and the output is rewritten after every row, so an interrupted run **resumes** when you re-run the same command (rows whose `answer` is filled are kept).
+`lens render --batch questions.csv` (or `.xlsx`, which needs `uv sync --extra batch`) answers each row in the chosen style (add `--short`, `--story` or `--explain`) and writes `questions.answers.csv` next to the input (override with `--out`). The question column is `--question-col`, else the first header containing "question", "requirement" or "query", else the first column. Input columns are passed through and four are appended: `answer`, `citations` (`path:lines; ...`), `confidence`, `stale_sources`. Progress goes to stderr, and the output is rewritten after every row, so an interrupted run **resumes** when you re-run the same command (rows whose `answer` is filled are kept).
 
 `confidence` values: `not_covered` (the model said so, or nothing was retrieved); `high` (at least two distinct cited sources and the top hit is `dual`, or has cosine ≥ `semantic_threshold + 0.15`); `low` (no valid citation, or top fused score < `batch_low_rrf`); otherwise `medium`. Review `low` and `not_covered` rows by hand.
 

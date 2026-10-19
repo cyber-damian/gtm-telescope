@@ -1,14 +1,13 @@
-# LLM used by `lens render`. Defaults to a LOCAL OpenAI-compatible server, so nothing leaves
-# the machine. Ollama: http://localhost:11434/v1   LM Studio: http://localhost:1234/v1
-# Hosted (opt-in, e.g. OpenAI): base_url "https://api.openai.com/v1", model "gpt-4.1-mini",
-# and set the key named by api_key_env in .env. Only the question and the retrieved excerpts
-# are sent to a hosted endpoint.
+# LLM used by `lens render`. The provider is picked from the API key set in .env:
+# ANTHROPIC_API_KEY (Claude) > OPENAI_API_KEY > MISTRAL_API_KEY, or LLM_PROVIDER to force one.
+# Only the question, the top retrieved excerpts and the prompt template are sent.
 llm:
-  base_url: "http://localhost:11434/v1"
-  model: "llama3.1:8b"
-  # Only required for non-localhost endpoints
-  api_key_env: "OPENAI_API_KEY"
   env_file: ".env"
+  anthropic_model: "claude-sonnet-4-5"
+  openai_model: "gpt-4.1-mini"
+  mistral_model: "mistral-small-latest"
+  # Maximum tokens in the generated answer
+  max_tokens: "1024"
 
 # Default data storage directory
 storage:

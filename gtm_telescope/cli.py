@@ -35,7 +35,8 @@ from gtm_telescope.config import (
     load_telescope_settings,
     parse_yaml_block,
 )
-from gtm_telescope.render import RenderResult, render_from_hits
+from gtm_telescope.prompts import DEFAULT_MODE, MODES, system_prompt
+from gtm_telescope.render import RenderResult, format_sales_display, render_from_hits
 from gtm_telescope.retrieval import Hit
 
 _PYPROJECT_NAME_RE = re.compile(
@@ -139,11 +140,6 @@ def load_config(path: Path) -> tuple[dict[str, str], dict[str, str]]:
     text = path.read_text(encoding="utf-8")
     llm = parse_yaml_block(text, "llm")
     storage = parse_yaml_block(text, "storage")
-    required_llm = ("base_url", "model", "api_key_env")
-    missing_llm = [k for k in required_llm if k not in llm]
-    if missing_llm:
-        sys.stderr.write(f"error: config {path} missing llm keys: {', '.join(missing_llm)}\n")
-        sys.exit(1)
     if "data_dir" not in storage:
         storage["data_dir"] = "data-storage"
     return llm, storage
@@ -190,8 +186,8 @@ def jina_grep_executable() -> str:
     if found:
         return found
     sys.stderr.write(
-        "error: jina-grep not found. Run ./scripts/bootstrap.sh to create .venv and install it, "
-        "or set paths.jina_grep_bin in config.yaml.\n"
+        "error: jina-grep not found. Run ./scripts/bootstrap.sh or "
+        "uv sync --extra calibrate, or set paths.jina_grep_bin in config.yaml.\n"
     )
     sys.exit(1)
 
@@ -418,9 +414,9 @@ def usage() -> None:
         f"  {prog} stop\n"
         f"  {prog} status\n"
         f"  {prog} focus <natural language query>\n"
-        f"  {prog} render [--json] <natural language query>\n"
-        f"  {prog} render --batch FILE.csv|FILE.xlsx [--question-col NAME] [--out FILE] "
-        "[--sheet NAME]\n"
+        f"  {prog} render [--short|--story|--explain] [--json] <natural language query>\n"
+        f"  {prog} render [--short|--story|--explain] --batch FILE.csv|FILE.xlsx "
+        "[--question-col NAME] [--out FILE] [--sheet NAME]\n"
         f"  {prog} calibrate\n"
         f"  {prog} eval [--file eval/questions.yaml] [--k 3,10] [--json]\n"
         f"  {prog} cache clear\n"
@@ -681,21 +677,25 @@ def cmd_eval(argv: list[str]) -> None:
     # Measurement tool, not a gate: exit code is always 0.
 
 
-def chat_completion(base_url: str, model: str, api_key: str, user_content: str) -> str:
-    """Thin CLI wrapper over :func:`llm.chat_completion` (errors -> stderr + exit 1)."""
+def chat_completion(
+    provider: llm_mod.Provider, system: str, user_content: str, *, max_tokens: int
+) -> str:
+    """Thin CLI wrapper over :func:`llm.complete` (errors -> stderr + exit 1)."""
     try:
-        llm_mod.validate_base_url(base_url)
-        if api_key and base_url.lower().startswith("http://"):
-            sys.stderr.write(
-                f"warning: llm.base_url uses plaintext http:// ({base_url!r}); "
-                "API key will be sent unencrypted (allowed for local endpoints)\n"
-            )
-        return llm_mod.chat_completion(
-            base_url, model, api_key, user_content, timeout=_ts().http_timeout
+        return llm_mod.complete(
+            provider, system, user_content, timeout=_ts().http_timeout, max_tokens=max_tokens
         )
     except llm_mod.LLMError as e:
-        sys.stderr.write(f"error: {e}\n")
+        sys.stderr.write(f"error: {provider.name}: {e}\n")
         sys.exit(1)
+
+
+def _llm_max_tokens(llm: dict[str, str]) -> int:
+    try:
+        v = int(llm.get("max_tokens", "").strip())
+    except ValueError:
+        return llm_mod.DEFAULT_MAX_TOKENS
+    return v if v > 0 else llm_mod.DEFAULT_MAX_TOKENS
 
 
 def cmd_calibrate(argv: list[str]) -> None:
@@ -795,6 +795,7 @@ def cmd_cache_info(argv: list[str]) -> None:
 class RenderArgs:
     question: str
     json_out: bool = False
+    mode: str = DEFAULT_MODE
     batch: str | None = None
     question_col: str | None = None
     out: str | None = None
@@ -806,12 +807,17 @@ def _parse_render_args(argv: list[str]) -> RenderArgs:
     words: list[str] = []
     opts: dict[str, str] = {}
     json_out = False
+    modes: list[str] = []
+    mode_flags = {f"--{m}": m for m in MODES}
     value_flags = {"--batch", "--question-col", "--out", "--sheet"}
     i = 0
     while i < len(argv):
         a = argv[i]
         if a == "--json":
             json_out = True
+        elif a in mode_flags:
+            if mode_flags[a] not in modes:
+                modes.append(mode_flags[a])
         elif a in value_flags:
             if i + 1 >= len(argv):
                 raise ValueError(f"{a} requires a value")
@@ -822,9 +828,14 @@ def _parse_render_args(argv: list[str]) -> RenderArgs:
         else:
             words.append(a)
         i += 1
+    if len(modes) > 1:
+        raise ValueError(
+            "use only one of " + ", ".join(f"--{m}" for m in MODES) + f" (got {len(modes)})"
+        )
     ra = RenderArgs(
         question=" ".join(words).strip(),
         json_out=json_out,
+        mode=modes[0] if modes else DEFAULT_MODE,
         batch=opts.get("--batch"),
         question_col=opts.get("--question-col"),
         out=opts.get("--out"),
@@ -843,16 +854,23 @@ def _parse_render_args(argv: list[str]) -> RenderArgs:
     return ra
 
 
-def _render_one(question: str, llm: dict[str, str], storage: dict[str, str]) -> RenderResult:
+def _render_one(
+    question: str,
+    provider: llm_mod.Provider,
+    mode: str,
+    storage: dict[str, str],
+    *,
+    max_tokens: int,
+) -> RenderResult:
     """Retrieve, ask the LLM, post-process. Exits via ``chat_completion`` on LLM errors."""
     ts = _ts()
-    api_key = os.environ.get(llm["api_key_env"], "")
+    system = system_prompt(mode)
     t0 = time.perf_counter()
     hit_list, _ = retrieve_hits(question, storage)
     result = render_from_hits(
         question,
         hit_list,
-        chat=lambda prompt: chat_completion(llm["base_url"], llm["model"], api_key, prompt),
+        chat=lambda prompt: chat_completion(provider, system, prompt, max_tokens=max_tokens),
         max_chunks=ts.render_max_chunks,
         semantic_threshold=ts.semantic_similarity_threshold,
         batch_low_rrf=ts.batch_low_rrf,
@@ -872,25 +890,22 @@ def cmd_render(argv: list[str]) -> None:
     data = data_storage_dir(storage)
     _require_calibrated_vector_cache(data)
     _require_markdown_or_text_corpus(data)
+    models = {p.name: llm.get(f"{p.name}_model", "") for p in llm_mod.PROVIDERS}
     try:
-        llm_mod.validate_base_url(llm["base_url"])
+        provider = llm_mod.select_provider(os.environ, models)
     except llm_mod.LLMError as e:
         sys.stderr.write(f"error: {e}\n")
         sys.exit(1)
-    if llm_mod.api_key_required(llm["base_url"]) and not os.environ.get(llm["api_key_env"], ""):
-        env_name = llm["api_key_env"]
-        sys.stderr.write(
-            f"error: set {env_name} for lens render (e.g. in repo .env via llm.env_file; "
-            f"see .env.example and config.yaml llm.api_key_env). "
-            f"A local llm.base_url (Ollama, LM Studio) needs no key.\n"
-        )
-        sys.exit(1)
+    max_tokens = _llm_max_tokens(llm)
+
+    def answer(q: str) -> RenderResult:
+        return _render_one(q, provider, ra.mode, storage, max_tokens=max_tokens)
 
     if ra.batch is not None:
         try:
             out = run_batch(
                 Path(ra.batch),
-                answer=lambda q: _render_one(q, llm, storage),
+                answer=answer,
                 question_col=ra.question_col,
                 out_path=Path(ra.out) if ra.out else None,
                 sheet=ra.sheet,
@@ -901,11 +916,11 @@ def cmd_render(argv: list[str]) -> None:
         sys.stdout.write(f"Wrote {out}\n")
         return
 
-    result = _render_one(ra.question, llm, storage)
+    result = answer(ra.question)
     if ra.json_out:
         sys.stdout.write(result.to_json())
         return
-    sys.stdout.write(result.full_text())
+    sys.stdout.write(format_sales_display(result, question=ra.question, mode=ra.mode))
     sys.stdout.write(_format_total_search_time(result.elapsed_ms / 1000.0))
 
 

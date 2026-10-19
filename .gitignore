@@ -56,3 +56,6 @@ resources/rg
 # Lens: local vector cache SQLite (under configured data_dir; default data-storage)
 **/.lens-cache/
 
+# Local-only corpus (not committed)
+data-storage/snyk/
+

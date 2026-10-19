@@ -23,17 +23,12 @@ done
 
 echo "Project root: $ROOT"
 
-if ! command -v python3 >/dev/null 2>&1; then
-  echo "error: python3 not found on PATH" >&2
+if ! command -v uv >/dev/null 2>&1; then
+  echo "error: uv not found on PATH" >&2
+  echo "  Install: https://docs.astral.sh/uv/getting-started/installation/" >&2
   exit 1
 fi
-
-if ! python3 -c 'import sys; assert sys.version_info >= (3, 10), "need 3.10+"' 2>/dev/null; then
-  echo "error: Python 3.10+ required (jina-grep). Found:" >&2
-  python3 --version >&2
-  exit 1
-fi
-echo "Python OK: $(python3 --version)"
+echo "uv OK: $(uv --version)"
 
 # Bundled ripgrep → resources/rg (pinned release)
 RG_VER="14.1.1"
@@ -108,31 +103,20 @@ if [[ ! -f "$ROOT/pyproject.toml" ]]; then
   exit 1
 fi
 
-VENV_PY="$ROOT/.venv/bin/python"
-VENV_PIP="$ROOT/.venv/bin/pip"
 JINA_VENV="$ROOT/.venv/bin/jina-grep"
 
 run_install() {
-  if command -v uv >/dev/null 2>&1; then
-    echo "Using uv to create/update .venv and install dependencies..."
-    uv venv --python python3
-    # Pin installs to this repo's .venv. Without --python, uv pip can target
-    # another environment and skip optional extras (e.g. docling for calibrate).
-    uv pip install --python "$ROOT/.venv/bin/python" ".[calibrate]"
-  else
-    echo "uv not found; using python3 -m venv and pip..."
-    python3 -m venv .venv
-    "$VENV_PY" -m pip install -U pip
-    "$VENV_PIP" install ".[calibrate]"
-  fi
+  echo "Syncing project environment (uv sync --extra calibrate)..."
+  uv sync --directory "$ROOT" --extra calibrate
   echo "Note: jina-grep targets Apple Silicon (MLX on macOS); other platforms may not work."
 }
 
 if [[ "$CHECK_ONLY" -eq 1 ]]; then
   :
 elif [[ "$FORCE_INSTALL" -eq 1 ]]; then
-  echo "(--force-install) Re-running install..."
-  run_install
+  echo "(--force-install) Re-syncing environment..."
+  uv sync --directory "$ROOT" --extra calibrate --reinstall-package gtm-telescope
+  echo "Note: jina-grep targets Apple Silicon (MLX on macOS); other platforms may not work."
 elif [[ ! -x "$JINA_VENV" ]]; then
   echo "Project venv missing or jina-grep not installed; bootstrapping..."
   run_install
@@ -140,11 +124,7 @@ else
   echo "Skipping install: $JINA_VENV already present (use --force-install to reinstall)"
 fi
 
-YAML_PY="python3"
-if [[ -x "$VENV_PY" ]]; then
-  YAML_PY="$VENV_PY"
-fi
-DATA_DIR="$(ROOT="$ROOT" PYTHONPATH="$ROOT" "$YAML_PY" <<'PY'
+DATA_DIR="$(ROOT="$ROOT" uv run --directory "$ROOT" python <<'PY'
 import os
 from pathlib import Path
 
@@ -200,11 +180,11 @@ else
   PREFETCH_RAN=0
   if [[ "${SKIP_MODEL_PREFETCH:-}" == "1" ]]; then
     echo "Skipping MLX nano model prefetch (SKIP_MODEL_PREFETCH=1)"
-  elif [[ -x "$VENV_PY" ]]; then
+  elif [[ -x "$JINA_VENV" ]]; then
     echo "Prefetching default nano MLX weights (jinaai/jina-embeddings-v5-text-nano-mlx)..." >&2
     echo "  This can take a few minutes (downloads from Hugging Face)." >&2
     unset HF_HUB_DISABLE_PROGRESS_BARS || true
-    "$VENV_PY" <<'PY'
+    uv run --directory "$ROOT" python <<'PY'
 from huggingface_hub import snapshot_download
 
 repo = "jinaai/jina-embeddings-v5-text-nano-mlx"
@@ -213,20 +193,20 @@ print(f"Model cache OK: {path}")
 PY
     PREFETCH_RAN=1
   else
-    echo "Note: skipping model prefetch (no $VENV_PY). Use project .venv for prefetch." >&2
+    echo "Note: skipping model prefetch (run uv sync first)." >&2
   fi
 
   if [[ "${SKIP_DOC_MODEL_PREFETCH:-}" == "1" ]]; then
     echo "Skipping Docling PDF model prefetch (SKIP_DOC_MODEL_PREFETCH=1)"
-  elif [[ -x "$VENV_PY" ]]; then
+  elif [[ -x "$JINA_VENV" ]]; then
     echo "Prefetching Docling PDF models (Hugging Face Hub)..." >&2
     echo "  This can take several minutes (large model download on first run)." >&2
     unset HF_HUB_DISABLE_PROGRESS_BARS || true
-    "$VENV_PY" -c \
+    uv run --directory "$ROOT" python -c \
       "from gtm_telescope.docling_prefetch import prefetch_docling_models; raise SystemExit(prefetch_docling_models())"
     PREFETCH_RAN=1
   else
-    echo "Note: skipping Docling prefetch (no $VENV_PY)." >&2
+    echo "Note: skipping Docling prefetch (run uv sync first)." >&2
   fi
 
   if [[ "$PREFETCH_RAN" -eq 1 ]]; then

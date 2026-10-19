@@ -1,4 +1,4 @@
-"""Tests for the OpenAI-compatible client in gtm_telescope.llm."""
+"""Tests for provider selection and the hosted LLM clients in gtm_telescope.llm."""
 
 from __future__ import annotations
 
@@ -27,51 +27,108 @@ class _Resp:
         return None
 
 
-OK = {"choices": [{"message": {"content": "hi [1]"}}]}
+OPENAI_OK = {"choices": [{"message": {"content": "hi [1]"}}]}
+ANTHROPIC_OK = {"content": [{"type": "text", "text": "hello "}, {"type": "text", "text": "[1]"}]}
+
+ALL_KEYS = {"ANTHROPIC_API_KEY": "a", "OPENAI_API_KEY": "o", "MISTRAL_API_KEY": "m"}
+
+
+# --- provider selection ----------------------------------------------------------------
 
 
 @pytest.mark.parametrize(
-    "url,expected",
+    "env,expected",
     [
-        ("http://localhost:11434/v1", True),
-        ("http://127.0.0.1:1234/v1", True),
-        ("https://localhost/v1", True),
-        ("https://api.openai.com/v1", False),
-        ("http://localhost.evil.example.com/v1", False),
-        ("http://127.0.0.1.evil.example.com/v1", False),
+        (ALL_KEYS, "anthropic"),
+        ({"OPENAI_API_KEY": "o", "MISTRAL_API_KEY": "m"}, "openai"),
+        ({"MISTRAL_API_KEY": "m"}, "mistral"),
+        ({"ANTHROPIC_API_KEY": "  ", "MISTRAL_API_KEY": "m"}, "mistral"),
     ],
 )
-def test_is_local_url_uses_hostname(url: str, expected: bool) -> None:
-    assert llm.is_local_url(url) is expected
-    assert llm.api_key_required(url) is (not expected)
+def test_select_provider_order(env: dict[str, str], expected: str) -> None:
+    assert llm.select_provider(env).name == expected
 
 
-def test_validate_base_url_rules() -> None:
-    llm.validate_base_url("https://api.openai.com/v1")
-    llm.validate_base_url("http://localhost:11434/v1")
-    llm.validate_base_url("http://127.0.0.1:8080/v1/")
-    for bad in ("http://example.com/v1", "http://localhost.evil.com/v1", "ftp://x"):
-        with pytest.raises(llm.LLMError):
-            llm.validate_base_url(bad)
+def test_select_provider_override() -> None:
+    p = llm.select_provider({**ALL_KEYS, "LLM_PROVIDER": "Mistral"})
+    assert (p.name, p.api_key, p.base_url) == ("mistral", "m", "https://api.mistral.ai/v1")
 
 
-def test_no_authorization_header_without_key() -> None:
-    with patch.object(llm.urllib.request, "urlopen", return_value=_Resp(OK)) as m:
-        out = llm.chat_completion("http://localhost:11434/v1", "llama3.1:8b", "", "q")
+def test_select_provider_override_with_empty_key_fails() -> None:
+    with pytest.raises(llm.LLMError, match="OPENAI_API_KEY is empty"):
+        llm.select_provider({"ANTHROPIC_API_KEY": "a", "LLM_PROVIDER": "openai"})
+
+
+def test_select_provider_unknown_override_fails() -> None:
+    with pytest.raises(llm.LLMError, match="not a known provider"):
+        llm.select_provider({**ALL_KEYS, "LLM_PROVIDER": "ollama"})
+
+
+def test_select_provider_no_key_fails() -> None:
+    with pytest.raises(llm.LLMError, match="no LLM API key set"):
+        llm.select_provider({"LLM_PROVIDER": ""})
+
+
+def test_select_provider_models_from_config() -> None:
+    assert llm.select_provider(ALL_KEYS, {"anthropic": "claude-x"}).model == "claude-x"
+    default = llm.select_provider(ALL_KEYS, {"anthropic": ""}).model
+    assert default == llm.PROVIDERS[0].default_model
+
+
+# --- clients ---------------------------------------------------------------------------
+
+
+def _provider(name: str) -> llm.Provider:
+    env = {"LLM_PROVIDER": name, f"{name.upper()}_API_KEY": "secret"}
+    return llm.select_provider(env, {name: "model-x"})
+
+
+def test_anthropic_request_shape_and_parse() -> None:
+    with patch.object(llm.urllib.request, "urlopen", return_value=_Resp(ANTHROPIC_OK)) as m:
+        out = llm.complete(_provider("anthropic"), "SYS", "q", max_tokens=321)
+    assert out == "hello [1]"
+    req = m.call_args.args[0]
+    assert req.full_url == "https://api.anthropic.com/v1/messages"
+    assert req.get_header("X-api-key") == "secret"
+    assert req.get_header("Anthropic-version") == llm.ANTHROPIC_VERSION
+    assert req.get_header("Authorization") is None
+    body = json.loads(req.data)
+    assert body == {
+        "model": "model-x",
+        "max_tokens": 321,
+        "system": "SYS",
+        "messages": [{"role": "user", "content": "q"}],
+    }
+
+
+def test_anthropic_bad_shape_becomes_llm_error() -> None:
+    with (
+        patch.object(llm.urllib.request, "urlopen", return_value=_Resp({"content": []})),
+        pytest.raises(llm.LLMError, match="unexpected"),
+    ):
+        llm.complete(_provider("anthropic"), "SYS", "q")
+
+
+@pytest.mark.parametrize(
+    "name,url,token_field",
+    [
+        ("openai", "https://api.openai.com/v1/chat/completions", "max_completion_tokens"),
+        ("mistral", "https://api.mistral.ai/v1/chat/completions", "max_tokens"),
+    ],
+)
+def test_openai_format_providers(name: str, url: str, token_field: str) -> None:
+    with patch.object(llm.urllib.request, "urlopen", return_value=_Resp(OPENAI_OK)) as m:
+        out = llm.complete(_provider(name), "SYS", "q", max_tokens=99)
     assert out == "hi [1]"
     req = m.call_args.args[0]
-    assert "Authorization" not in req.headers
-    assert req.full_url == "http://localhost:11434/v1/chat/completions"
+    assert req.full_url == url
+    assert req.get_header("Authorization") == "Bearer secret"
     body = json.loads(req.data)
-    assert body["model"] == "llama3.1:8b"
-    assert body["messages"][0]["content"] == llm.SYSTEM_PROMPT
-    assert body["messages"][1] == {"role": "user", "content": "q"}
-
-
-def test_authorization_header_with_key() -> None:
-    with patch.object(llm.urllib.request, "urlopen", return_value=_Resp(OK)) as m:
-        llm.chat_completion("https://api.example.com/v1", "m", "secret", "q")
-    assert m.call_args.args[0].get_header("Authorization") == "Bearer secret"
+    assert body["model"] == "model-x" and body[token_field] == 99
+    assert body["messages"] == [
+        {"role": "system", "content": "SYS"},
+        {"role": "user", "content": "q"},
+    ]
 
 
 def test_http_error_becomes_llm_error() -> None:
@@ -80,7 +137,7 @@ def test_http_error_becomes_llm_error() -> None:
         patch.object(llm.urllib.request, "urlopen", side_effect=err),
         pytest.raises(llm.LLMError, match="HTTP 500"),
     ):
-        llm.chat_completion("https://api.example.com/v1", "m", "k", "x")
+        llm.complete(_provider("openai"), "SYS", "x")
 
 
 def test_connection_refused_becomes_llm_error() -> None:
@@ -90,21 +147,21 @@ def test_connection_refused_becomes_llm_error() -> None:
         ),
         pytest.raises(llm.LLMError, match="request failed"),
     ):
-        llm.chat_completion("http://localhost:11434/v1", "m", "", "x")
+        llm.complete(_provider("mistral"), "SYS", "x")
 
 
-def test_bad_shape_becomes_llm_error() -> None:
+def test_openai_bad_shape_becomes_llm_error() -> None:
     with (
         patch.object(llm.urllib.request, "urlopen", return_value=_Resp({"choices": []})),
         pytest.raises(llm.LLMError, match="unexpected"),
     ):
-        llm.chat_completion("http://localhost:11434/v1", "m", "", "x")
+        llm.complete(_provider("openai"), "SYS", "x")
 
 
-def test_remote_http_rejected_before_request() -> None:
+def test_plain_http_rejected_before_request() -> None:
     with (
         patch.object(llm.urllib.request, "urlopen") as m,
         pytest.raises(llm.LLMError, match="https://"),
     ):
-        llm.chat_completion("http://example.com/v1", "m", "k", "x")
+        llm.chat_completion("http://example.com/v1", "m", "k", "x", system_prompt="S")
     m.assert_not_called()

@@ -33,7 +33,7 @@ def _require_openpyxl() -> Any:
         import openpyxl
     except ImportError as e:
         raise BatchError(
-            "XLSX support needs openpyxl. Install the batch extra: pip install '.[batch]'"
+            "XLSX support needs openpyxl. Install the batch extra: uv sync --extra batch"
         ) from e
     return openpyxl
 

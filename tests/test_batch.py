@@ -168,5 +168,5 @@ def test_xlsx_without_openpyxl_gives_install_hint(
 
     (tmp_path / "q.xlsx").write_bytes(b"x")
     monkeypatch.setattr(builtins, "__import__", fake_import)
-    with pytest.raises(batch.BatchError, match=r"\.\[batch\]"):
+    with pytest.raises(batch.BatchError, match=r"uv sync --extra batch"):
         batch.read_table(tmp_path / "q.xlsx")

@@ -68,7 +68,7 @@ class RenderResult:
         return "\n".join(lines)
 
     def full_text(self) -> str:
-        """Answer plus ``Sources:`` block, as printed by ``lens render``."""
+        """Legacy plain layout (answer + ``Sources:``). Prefer :func:`format_sales_display`."""
         block = self.sources_block
         return f"{self.answer}\n\n{block}\n" if block else f"{self.answer}\n"
 
@@ -132,6 +132,94 @@ def sanitize_citations(text: str, n_sources: int) -> tuple[str, list[int]]:
 
 def is_not_covered(text: str) -> bool:
     return text.strip().lower().startswith(NOT_COVERED_PREFIX)
+
+
+_MODE_LABELS = {"short": "Quick reply (2 sentences)", "story": "Customer story", "explain": "Deep dive"}
+
+_CONFIDENCE_LABELS = {
+    "high": "HIGH — OK to say on a call",
+    "medium": "MEDIUM — stick to the script below",
+    "low": "LOW — verify before saying this",
+    "not_covered": "NOT IN DOCS — do not claim on a call",
+}
+
+
+def strip_citation_markers(text: str) -> str:
+    """Remove ``[n]`` markers so the text reads aloud naturally."""
+    out = _CITE_RE.sub("", text)
+    out = re.sub(r"\s+([.,!?;:])", r"\1", out)
+    return re.sub(r"  +", " ", out).strip()
+
+
+def _split_answer_sections(answer: str) -> tuple[list[str], str]:
+    """Return ``(warnings, body)`` extracted from post-processed ``answer``."""
+    warnings: list[str] = []
+    text = answer.strip()
+    if text.startswith(UNCITED_WARNING):
+        warnings.append(UNCITED_WARNING)
+        text = text[len(UNCITED_WARNING) :].strip()
+    stale = [ln for ln in text.splitlines() if ln.startswith("Stale source [")]
+    body = "\n".join(ln for ln in text.splitlines() if ln not in stale).strip()
+    warnings.extend(stale)
+    return warnings, body
+
+
+def _format_source_line(c: Citation) -> str:
+    parts = [f"[{c.n}] {c.location}"]
+    if c.doc_date:
+        parts.append(f"updated {c.doc_date}")
+    if c.stale:
+        parts.append("stale — confirm before citing")
+    return " · ".join(parts)
+
+
+def format_sales_display(
+    result: RenderResult,
+    *,
+    question: str,
+    mode: str = "short",
+) -> str:
+    """Terminal layout for sales: skimmable sections and a citation-free script to read aloud."""
+    mode_label = _MODE_LABELS.get(mode, mode)
+    conf = _CONFIDENCE_LABELS.get(result.confidence, result.confidence.upper())
+    warnings, body = _split_answer_sections(result.answer)
+    script = strip_citation_markers(body)
+
+    lines: list[str] = [
+        "CUSTOMER QUESTION",
+        f"  {question.strip()}",
+        "",
+        f"SAY THIS · {mode_label}",
+        f"  {conf}",
+        "─" * 56,
+    ]
+    if script:
+        for para in re.split(r"\n\s*\n", script):
+            p = para.strip()
+            if p:
+                lines.append(p)
+                lines.append("")
+    else:
+        lines.append("(no answer text)")
+        lines.append("")
+
+    if result.citations:
+        lines.extend(["IF THEY ASK WHERE THIS IS FROM", "─" * 56])
+        for c in result.citations:
+            lines.append(f"  · {_format_source_line(c)}")
+        lines.append("")
+
+    if warnings or result.not_covered:
+        lines.extend(["CHECK BEFORE YOU SEND", "─" * 56])
+        for w in warnings:
+            lines.append(f"  ⚠ {w}")
+        if result.not_covered and not any("Not covered" in w for w in warnings):
+            lines.append("  ⚠ Treat as internal-only until you confirm with docs or PM.")
+        lines.append("")
+
+    while lines and lines[-1] == "":
+        lines.pop()
+    return "\n".join(lines) + "\n"
 
 
 def compute_confidence(
@@ -254,4 +342,6 @@ __all__ = [
     "postprocess_answer",
     "render_from_hits",
     "sanitize_citations",
+    "format_sales_display",
+    "strip_citation_markers",
 ]

@@ -212,10 +212,13 @@ def test_render_settings_invalid_fall_back() -> None:
     assert c.render_max_chunks == 8 and c.batch_low_rrf == 0.02
 
 
-def test_shipped_config_defaults_to_local_llm() -> None:
+def test_shipped_config_sets_a_model_per_provider() -> None:
     from pathlib import Path
+
+    from gtm_telescope.llm import PROVIDERS
 
     text = (Path(__file__).resolve().parent.parent / "config.yaml").read_text(encoding="utf-8")
     llm = parse_yaml_block(text, "llm")
-    assert llm["base_url"] == "http://localhost:11434/v1"
-    assert llm["model"] == "llama3.1:8b"
+    for p in PROVIDERS:
+        assert llm[f"{p.name}_model"]
+    assert "base_url" not in llm
